@@ -1,0 +1,258 @@
+//! GH#160 — the vendored portfolio mirror, checked against the REAL engine layout.
+//!
+//! `slab_types_v16.rs` mirrors the converged v17 `PortfolioAccountV16Account` and
+//! reads it by `bytemuck` cast in `decode_portfolio`. That cast is the only place
+//! portfolio bytes are interpreted, and every security decision downstream — owner,
+//! the `market_id` slot-reuse anchor, the lock/stale transfer gates — is a read at a
+//! byte offset through it.
+//!
+//! The module's `const_assert!`s measure the mirror against ITSELF. They prove
+//! internal consistency and say nothing about correspondence to the engine. That is
+//! exactly the failure SCHEMA_DRIFT_v12.19.md warns about: "mirror schema drift can
+//! mask itself as compile-pass". If the engine inserts or reorders a field ahead of
+//! the ones read here, the provenance checks still pass while `owner` and the gate
+//! flags come from the wrong bytes — mint against a position you do not own,
+//! transfer decisions on garbage.
+//!
+//! These tests compare the mirror to the pinned real engine crate, so drift is a
+//! FAILING TEST rather than a silent misread. The pin is deliberate: bumping it is a
+//! decision with a diff to read, not something that follows `main` on its own.
+//!
+//! N-2 — WHAT THIS FILE CANNOT DO ON ITS OWN. A pin is a guard only while it points at
+//! the engine we ship against. Ours stopped: it sat at `99bc9c8d` while the shipping
+//! engine moved 228 commits through the layout-18 change, and because the stale pin and
+//! the stale mirror were field-identical, all of this was green while `legs`,
+//! `stale_state`, `liquidation_lock`, `close_progress` and `resolved_payout_receipt`
+//! were 192 bytes out. The test was comparing the mirror to a copy of itself.
+//! `scripts/engine-pin-check.sh` (CI job `engine-pin`) re-runs THIS FILE against the
+//! engine percolator-prog actually compiles, so the rot fails CI instead of accumulating.
+//! Both matter: this one is deterministic and offline, that one tracks a moving target.
+
+use core::mem::{align_of, offset_of, size_of};
+
+use percolator::PortfolioAccountV16Account as EnginePortfolio;
+use percolator_nft::slab_types_v16::PortfolioAccountV16Account as MirrorPortfolio;
+
+#[test]
+fn mirror_total_size_matches_the_engine() {
+    // The headline number. `EXPECTED_PORTFOLIO_ACCOUNT_SIZE` is 9419 and is asserted
+    // against the mirror at compile time — here it is asserted against the thing it
+    // is supposed to describe.
+    assert_eq!(
+        size_of::<MirrorPortfolio>(),
+        size_of::<EnginePortfolio>(),
+        "the vendored portfolio mirror has drifted from the engine's layout — \
+         decode_portfolio reads every security-relevant field at a fixed offset, so \
+         this is a silent misread, not a compile error"
+    );
+}
+
+#[test]
+fn mirror_alignment_matches_the_engine() {
+    // A bytemuck cast over a differently-aligned type is a different failure from a
+    // differently-sized one, and it would not show up in the size check.
+    assert_eq!(
+        align_of::<MirrorPortfolio>(),
+        align_of::<EnginePortfolio>(),
+        "mirror alignment differs from the engine's"
+    );
+}
+
+/// Every field the NFT program actually reads, at its byte offset in both types.
+///
+/// Scoped to what is read rather than to every field: those are the offsets a
+/// security decision depends on, and pinning fields nobody reads would make this
+/// test fail on harmless upstream churn and get weakened or deleted.
+#[test]
+fn every_field_the_nft_program_reads_sits_at_the_same_offset() {
+    assert_eq!(
+        offset_of!(MirrorPortfolio, owner),
+        offset_of!(EnginePortfolio, owner),
+        "`owner` offset drift — mint/burn authorization reads this; a wrong offset \
+         means minting against a position you do not own"
+    );
+    assert_eq!(
+        offset_of!(MirrorPortfolio, provenance_header),
+        offset_of!(EnginePortfolio, provenance_header),
+        "`provenance_header` offset drift — the market_id slot-reuse anchor and the \
+         header checks are read through this"
+    );
+    assert_eq!(
+        offset_of!(MirrorPortfolio, capital),
+        offset_of!(EnginePortfolio, capital),
+        "`capital` offset drift — position valuation reads this"
+    );
+    // N-1: the three fields above all sit BEFORE every layout-18 insertion, so
+    // they still agreed while the mirror was 192 B short and `legs`,
+    // `stale_state` and `liquidation_lock` were all wrong. Only
+    // `mirror_total_size_matches_the_engine` caught it. A test named "every
+    // field the NFT program reads" that omits the transfer gate's own fields is
+    // the vacuity this file exists to prevent, so pin them too.
+    assert_eq!(
+        offset_of!(MirrorPortfolio, legs),
+        offset_of!(EnginePortfolio, legs),
+        "`legs` offset drift — active_leg_slot_for_asset, the market_id slot-reuse \
+         anchor and epoch_snap_at_mint are all read through this array"
+    );
+    assert_eq!(
+        offset_of!(MirrorPortfolio, stale_state),
+        offset_of!(EnginePortfolio, stale_state),
+        "`stale_state` offset drift — a transfer gate flag"
+    );
+    assert_eq!(
+        offset_of!(MirrorPortfolio, b_stale_state),
+        offset_of!(EnginePortfolio, b_stale_state),
+        "`b_stale_state` offset drift — a transfer gate flag"
+    );
+    assert_eq!(
+        offset_of!(MirrorPortfolio, liquidation_lock),
+        offset_of!(EnginePortfolio, liquidation_lock),
+        "`liquidation_lock` offset drift — a transfer gate flag"
+    );
+    assert_eq!(
+        offset_of!(MirrorPortfolio, rebalance_lock),
+        offset_of!(EnginePortfolio, rebalance_lock),
+        "`rebalance_lock` offset drift — a transfer gate flag"
+    );
+    assert_eq!(
+        offset_of!(MirrorPortfolio, close_progress),
+        offset_of!(EnginePortfolio, close_progress),
+        "`close_progress` offset drift — close_in_progress_for_asset reads this"
+    );
+    assert_eq!(
+        offset_of!(MirrorPortfolio, resolved_payout_receipt),
+        offset_of!(EnginePortfolio, resolved_payout_receipt),
+        "`resolved_payout_receipt` offset drift — the settled-position gate reads this"
+    );
+}
+
+/// The leg is the sub-struct layout 18 actually changed, and the NFT reads four
+/// of its fields. Pin its size and those offsets against the engine: a leg that
+/// is the wrong SIZE shifts every leg after slot 0 as well as `source_domains`
+/// and everything past it, which is how 128 of the 192 drifted bytes arose.
+#[test]
+fn every_leg_field_the_nft_program_reads_sits_at_the_same_offset() {
+    use percolator::PortfolioLegV16Account as EngineLeg;
+    use percolator_nft::slab_types_v16::PortfolioLegV16Account as MirrorLeg;
+    assert_eq!(
+        size_of::<MirrorLeg>(),
+        size_of::<EngineLeg>(),
+        "leg size drift — shifts every leg after slot 0 and the whole tail"
+    );
+    assert_eq!(
+        align_of::<MirrorLeg>(),
+        align_of::<EngineLeg>(),
+        "leg alignment drift"
+    );
+    assert_eq!(
+        offset_of!(MirrorLeg, active),
+        offset_of!(EngineLeg, active),
+        "`leg.active` offset drift — the eligibility scan reads this"
+    );
+    assert_eq!(
+        offset_of!(MirrorLeg, asset_index),
+        offset_of!(EngineLeg, asset_index),
+        "`leg.asset_index` offset drift — the eligibility scan matches on this"
+    );
+    assert_eq!(
+        offset_of!(MirrorLeg, market_id),
+        offset_of!(EngineLeg, market_id),
+        "`leg.market_id` offset drift — this is the slot-reuse anchor"
+    );
+    assert_eq!(
+        offset_of!(MirrorLeg, epoch_snap),
+        offset_of!(EngineLeg, epoch_snap),
+        "`leg.epoch_snap` offset drift — snapshotted at mint and logged by valuation; \
+         layout 18 moved it 78 -> 86 by inserting kf_epoch_snap ahead of it"
+    );
+}
+
+/// N-2: offsets are not the whole layout. `decode_portfolio` compares two engine
+/// CONSTANTS for exact equality before it trusts a single byte — the account
+/// version and the layout discriminator — and a change to either is invisible to
+/// every offset assertion in this file.
+///
+/// Layout 16 → 18 moved the offsets AND the discriminator together, which is why
+/// the offset tests were enough to catch it once someone looked. They would not
+/// be enough next time: an engine that re-stamps `V16_LAYOUT_DISCRIMINATOR`
+/// without moving a field — a semantic re-issue of an identically shaped account
+/// — leaves all five tests above green while `decode_portfolio` rejects every
+/// live portfolio with `BadLayoutDiscriminator`. That is a green parity row over
+/// a dead program, which is exactly what N-1 was, so pin the values too.
+///
+/// `V16_MAX_PORTFOLIO_ASSETS_N` and `PORTFOLIO_SOURCE_DOMAIN_CAP` are here for a
+/// different reason: they are array bounds the mirror hard-codes rather than
+/// derives, so a change to them shows up in the total size — but only as a number
+/// that has to be diagnosed. Named, it diagnoses itself.
+#[test]
+fn the_constants_decode_portfolio_gates_on_have_the_same_values() {
+    assert_eq!(
+        percolator_nft::slab_types_v16::V16_LAYOUT_DISCRIMINATOR,
+        percolator::V16_LAYOUT_DISCRIMINATOR,
+        "`V16_LAYOUT_DISCRIMINATOR` value drift — decode_portfolio compares this for \
+         EXACT equality against the byte the wrapper stamped, so a mirror holding the \
+         old value refuses every live portfolio and the NFT feature goes inert"
+    );
+    assert_eq!(
+        percolator_nft::slab_types_v16::V16_ACCOUNT_VERSION,
+        percolator::V16_ACCOUNT_VERSION,
+        "`V16_ACCOUNT_VERSION` value drift — the provenance-header version gate"
+    );
+    assert_eq!(
+        percolator_nft::slab_types_v16::V16_MAX_PORTFOLIO_ASSETS_N,
+        percolator::V16_MAX_PORTFOLIO_ASSETS_N,
+        "`V16_MAX_PORTFOLIO_ASSETS_N` drift — the number of leg slots the mirror \
+         reserves; the eligibility scan walks all of them"
+    );
+    assert_eq!(
+        percolator_nft::slab_types_v16::PORTFOLIO_SOURCE_DOMAIN_CAP,
+        percolator::PORTFOLIO_SOURCE_DOMAIN_CAP,
+        "`PORTFOLIO_SOURCE_DOMAIN_CAP` drift — the inline source-domain array bound, \
+         which sits between `legs` and every transfer-gate flag"
+    );
+}
+
+#[test]
+fn the_provenance_header_itself_matches() {
+    // The header is where market_id lives, and market_id is the slot-reuse anchor
+    // the transfer gate turns on. A header that is the right SIZE but the wrong
+    // SHAPE would pass the total-size check above.
+    use percolator::ProvenanceHeaderV16Account as EngineHeader;
+    use percolator_nft::slab_types_v16::ProvenanceHeaderV16Account as MirrorHeader;
+    assert_eq!(
+        size_of::<MirrorHeader>(),
+        size_of::<EngineHeader>(),
+        "provenance header size drift"
+    );
+    // Pin EVERY header field, not a sample. The header is small and entirely
+    // security-relevant: `market_group_id` + `portfolio_account_id` are the
+    // slot-reuse anchor the transfer gate turns on, `owner` is the authorization,
+    // and `version`/`layout_discriminator` are what make a mismatched account fail
+    // closed instead of being reinterpreted.
+    assert_eq!(
+        offset_of!(MirrorHeader, market_group_id),
+        offset_of!(EngineHeader, market_group_id),
+        "`market_group_id` offset drift — part of the slot-reuse anchor; a wrong \
+         offset makes transfer-gate decisions read garbage"
+    );
+    assert_eq!(
+        offset_of!(MirrorHeader, portfolio_account_id),
+        offset_of!(EngineHeader, portfolio_account_id),
+        "`portfolio_account_id` offset drift"
+    );
+    assert_eq!(
+        offset_of!(MirrorHeader, owner),
+        offset_of!(EngineHeader, owner),
+        "header `owner` offset drift"
+    );
+    assert_eq!(
+        offset_of!(MirrorHeader, version),
+        offset_of!(EngineHeader, version),
+        "`version` offset drift — this is what makes a foreign account fail closed"
+    );
+    assert_eq!(
+        offset_of!(MirrorHeader, layout_discriminator),
+        offset_of!(EngineHeader, layout_discriminator),
+        "`layout_discriminator` offset drift"
+    );
+}

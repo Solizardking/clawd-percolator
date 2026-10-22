@@ -1,0 +1,22 @@
+{
+  "network": "clawd",
+  "rpc": "https://rpc.clawdchain.trade",
+  "rpcIp": "http://95.216.154.157:8080",
+  "composeRpc": "http://validator:8080",
+  "deployRpc": "http://95.216.154.157:8080",
+  "programs": {
+    "wrapper": "6Grr3eyuJVME5gDbeT6g6Q3pojQGSuSDaEmHDM7QYhzx",
+    "stake": "85rgQvJsqVq5gF9TPMtxmPQaoVMGK1wd6qx1FZqfXk5q",
+    "nft": "GDaUkuhbErfBuL92oV93bWWHEVn9NF7pRNikSeq6nHLR"
+  },
+  "binaries": {
+    "wrapper": "percolator-prog",
+    "stake": "percolator-stake",
+    "nft": "percolator-nft"
+  },
+  "binaryFiles": {
+    "wrapper": "/programs/percolator-prog.so",
+    "stake": "/programs/percolator-stake.so",
+    "nft": "/programs/percolator-nft.so"
+  }
+}

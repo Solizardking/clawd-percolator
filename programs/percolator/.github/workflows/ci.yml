@@ -1,0 +1,208 @@
+name: CI
+
+# Restored 2026-08-27. `main` branch protection requires four status checks —
+# test, clippy, fmt, "Kani Proofs" — but this repo had NO .github/workflows at all, so none
+# of them could ever report and every PR to main was permanently unmergeable. The last
+# workflow run was 2026-04-18.
+#
+# The job NAMES below are chosen to match those required contexts exactly. Renaming a job
+# here silently re-blocks every PR, so don't.
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_MIN_STACK: 8388608
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --verbose
+      # --no-fail-fast matters: without it cargo stops at the first failing SUITE and the
+      # totals it prints are a truncated subset. That has produced wrong pass/fail numbers
+      # in this project before.
+      - name: Test
+        run: cargo test --no-fail-fast --verbose
+
+  audit-scan:
+    name: audit-scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Added 2026-09-15 (H-2). The `test` job above runs the DEFAULT feature set, in which
+    # the O(N) audit-scan invariants do not exist: `validate_shape_full_audit_scan`
+    # (src/v16.rs:8318) is `#[cfg(any(test, kani, feature = "audit-scan"))]`, and an
+    # integration test builds the lib as a DEPENDENCY, so cfg(test) is not set on the lib
+    # and the scan compiles out. `validate_shape_audit_scan` (:8610-8619) is then a no-op
+    # returning Ok(()). That is why `cargo test --test v16_spec_tests` reported 180/0 while
+    # `--features audit-scan` reported 172/8: eight fixtures had been merged green, over
+    # five separate PRs, in a build that never ran the checks they broke.
+    #
+    # Nothing at 2c38570a ran this feature — no workflow, script, Makefile or justfile —
+    # so the split the in-tree tripwire module warns about in its own doc
+    # (src/v16.rs:23902-23913: "a state the default build commits and the audit build
+    # rejects — a split invisible to anyone not running the audit feature") had no gate at
+    # all. This job is that gate. It is deliberately a SEPARATE job rather than an extra
+    # step on `test`: the job names above are required status contexts on main and must not
+    # move, and a second job also keeps the two builds' caches and failures distinct.
+    #
+    # This job is NOT yet a required context in branch protection; adding it there is a
+    # repo-settings change, not a workflow one.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.1
+      - uses: Swatinem/rust-cache@v2
+      # WIDENED 2026-09-15 (AS-03), from `--test v16_spec_tests` + `--lib` to --all-targets.
+      #
+      # The original two steps were scoped for a measured reason, recorded when this job was
+      # added: `cargo test --features audit-scan --no-fail-fast` across every target was NOT
+      # green — tests/grief_econ_final.rs was 5 passed / 2 failed (7/0 by default), so
+      # --all-targets would have landed this job red on day one. That failure is now fixed:
+      # its `drain_only_holdout` fixture hand-wrote a one-sided residual OI (oi_eff_long_q =
+      # oi, oi_eff_short_q = 0) on an Active asset in a Live market, which the matched-book
+      # conjunct at src/v16.rs:8501-8503 rejects, and never mirrored the slot's
+      # resolved_payout_blocker_count into the header total (:8331-8332). Both are fixture
+      # drift, repaired in tests/ only.
+      #
+      # Measured before widening, on this commit: `cargo test --features audit-scan
+      # --no-fail-fast --all-targets` is green on every target — lib 67, backing_double_claim_fuzz
+      # 13, deposit_live_only_448 4, grief_econ_final 7, lp_burn_repro 36,
+      # no_seniority_bypass_143 3, resolved_insolvent_fuzz 2, v16_spec_tests 179 (180 minus the
+      # one test cfg-gated out of this build), and 0-test proof/fuzz targets. Widening is what
+      # makes the gate cover the whole tree rather than the one suite that happened to be
+      # triaged; a new red target still names itself in the output, so failures stay
+      # attributable.
+      #
+      # --all-targets excludes doc-tests; this crate has none (`Doc-tests percolator` reports
+      # 0 passed), so nothing is dropped by not running them here.
+      - name: All targets under --features audit-scan
+        run: cargo test --features audit-scan --no-fail-fast --verbose --all-targets
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.1
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # -W, not -D: the crate currently has ~57 warnings. Making them errors would fail every
+      # PR for pre-existing debt rather than for anything the PR did.
+      - name: Clippy
+        run: cargo clippy --all-targets -- -W clippy::all
+
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      # PINNED. `stable` moves, and rustfmt output changes between releases: this job
+      # failed on a file that `rustfmt --check` accepts locally (exit 0, no diff) purely
+      # because the runner had a newer stable. A moving formatter is a flaky required check.
+      - uses: dtolnay/rust-toolchain@1.93.1
+        with:
+          components: rustfmt
+      # SCOPED TO THE FILES THIS PR TOUCHES, deliberately.
+      #
+      # `cargo fmt --check` over the whole repo fails today: there are 243 diff hunks,
+      # including src/v16.rs. Reformatting them is NOT deployment-neutral — measured
+      # 2026-08-27, running `cargo fmt` changed the compiled wrapper .so from 2e88fb83… to
+      # 9f25ac81…, because release builds embed file/line in panic paths. So a repo-wide
+      # reformat has to be sequenced deliberately against a deploy, not smuggled in with a
+      # CI restoration.
+      #
+      # Checking only changed files still enforces the property that matters right now — no
+      # NEW drift — and reports honestly instead of being permanently red. Switch this to a
+      # whole-repo `cargo fmt --check` once the reformat has landed.
+      - name: Check formatting of changed files
+        run: |
+          set -euo pipefail
+          BASE="${{ github.event.pull_request.base.sha }}"
+          if [ -z "$BASE" ]; then
+            echo "not a pull_request event — checking the last commit's files"
+            BASE=$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)
+          fi
+          FILES=$(git diff --name-only --diff-filter=ACMR "$BASE" HEAD -- '*.rs' || true)
+          if [ -z "$FILES" ]; then
+            echo "no Rust files changed — nothing to check"
+            exit 0
+          fi
+          echo "checking:"; echo "$FILES" | sed 's/^/  /'
+          # shellcheck disable=SC2086
+          rustfmt --edition 2021 --check $FILES
+
+  kani:
+    name: Kani Proofs
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.93.1
+      - uses: Swatinem/rust-cache@v2
+      # POLICY (decided 2026-08-27): the full 240-harness suite runs LOCALLY, not here.
+      #
+      # This job is a deliberate smoke check, not verification coverage. It exists because
+      # `Kani Proofs` is a REQUIRED status check on main: before it was restored this repo had
+      # no workflows at all, so that context could never report and every PR was permanently
+      # unmergeable. A check that cannot report is worse than a narrow one.
+      #
+      # What it actually buys, stated plainly so nobody mistakes it for more:
+      #   - Kani still installs and the crate still codegens under cfg(kani)
+      #   - the proof harnesses still compile (`--tests` builds the whole test target)
+      #   - the two harnesses below still verify, and are still NON-VACUOUS
+      # What it does NOT buy: any assurance about the other ~238 harnesses.
+      #
+      # Do NOT add slow harnesses here. Choice is a resource decision, not a taste one: a
+      # hosted runner was killed mid-check ("The runner has received a shutdown signal") on a
+      # harness that measured 799s. CBMC is memory-hungry and the historical Kani workflow used
+      # a larger blacksmith runner. The two below measure 1s and 2s; --jobs 1 keeps peak
+      # memory down.
+      #
+      # The full suite, including the two harnesses repaired in #147, is run LOCALLY with
+      # ~/percolator-ops/artifacts/kani-2026-08-24/run_kani.sh, which records a results TSV and
+      # classifies a harness with unreachable covers as VACUOUS rather than PASS.
+      - name: Install Kani
+        run: |
+          cargo install --locked kani-verifier
+          cargo kani setup
+      - name: Verify repaired harnesses
+        run: |
+          set -euo pipefail
+          for H in \
+            proof_v16_asset_recovery_transition_freezes_price_and_bumps_once \
+            proof_v17_lp_vault_cooldown_enforcement
+          do
+            echo "=== $H ==="
+            # --features fuzz is REQUIRED: `--tests` builds every test target, and the
+            # v16_fuzzing target is feature-gated. Without it cargo aborts with
+            # "target v16_fuzzing ... requires the features: fuzz" before any proof runs.
+            cargo kani --tests --features fuzz --jobs 1 --harness "$H" --output-format terse | tee "/tmp/$H.log"
+            # A pass is not enough. Kani reports SUCCESSFUL for a harness whose covers are
+            # unreachable, which is precisely how these two hid. Gate on the cover line.
+            if grep -qE "0 of [0-9]+ cover properties satisfied" "/tmp/$H.log"; then
+              echo "::error::$H is VACUOUS — cover properties unreachable"
+              exit 1
+            fi
+          done

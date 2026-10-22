@@ -1,0 +1,20 @@
+const web3=require('@solana/web3.js');const spl=require('@solana/spl-token');const fs=require('fs');const {create}=require('./perc-core');
+const ids0=Object.fromEntries(fs.readFileSync(__dirname+'/../ids.txt','utf8').trim().split(' ').map(s=>s.split('=')));
+const C=create({wrapper:ids0.W,stake:ids0.S,nft:ids0.N});const conn=new web3.Connection(process.env.RPC||'https://rpc.clawdchain.trade','confirmed');
+const kp=f=>web3.Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(f))));
+const send=(ixs,s)=>web3.sendAndConfirmTransaction(conn,new web3.Transaction().add(...ixs),s,{commitment:'confirmed'});
+(async()=>{const house=kp(__dirname+'/../.keys/payer.json');const name=process.argv[2]||'clawd';const out={name};
+ const mint=await spl.createMint(conn,house,house.publicKey,null,6);out.mint=mint.toBase58();
+ const market=web3.Keypair.generate();out.market=market.publicKey.toBase58();
+ out.initSig=await send([C.createProgramAccount(house.publicKey,market.publicKey,await conn.getMinimumBalanceForRentExemption(C.MARKET_LEN),C.MARKET_LEN),...C.budget(),C.initMarket(house.publicKey,market.publicKey,mint)],[house,market]);
+ out.vault=(await spl.getOrCreateAssociatedTokenAccount(conn,house,mint,C.vaultAuthority(market.publicKey),true)).address.toBase58();
+ out.nftRegistrySig=await send([...C.budget(),C.setNftProgram(house.publicKey,market.publicKey)],[house]);
+ const hp=web3.Keypair.generate();await send([C.createProgramAccount(house.publicKey,hp.publicKey,await conn.getMinimumBalanceForRentExemption(C.PORTFOLIO_LEN),C.PORTFOLIO_LEN),...C.budget(),C.initPortfolio(house.publicKey,market.publicKey,hp.publicKey)],[house,hp]);out.housePortfolio=hp.publicKey.toBase58();
+ const ata=await spl.getOrCreateAssociatedTokenAccount(conn,house,mint,house.publicKey);await spl.mintTo(conn,house,mint,ata.address,house,1_000_000_000_000_000n);
+ await send([...C.budget(),C.deposit(house.publicKey,out,hp.publicKey,ata.address,100_000_000_000_000n)],[house]);
+ const lp=web3.Keypair.generate(),sv=web3.Keypair.generate();out.lpMint=lp.publicKey.toBase58();out.stakeVault=sv.publicKey.toBase58();
+ out.poolSig=await send([web3.SystemProgram.createAccount({fromPubkey:house.publicKey,newAccountPubkey:lp.publicKey,lamports:await conn.getMinimumBalanceForRentExemption(82),space:82,programId:spl.TOKEN_PROGRAM_ID}),
+  web3.SystemProgram.createAccount({fromPubkey:house.publicKey,newAccountPubkey:sv.publicKey,lamports:await conn.getMinimumBalanceForRentExemption(165),space:165,programId:spl.TOKEN_PROGRAM_ID}),...C.budget(),C.initPool(house.publicKey,out,lp.publicKey,sv.publicKey,10)],[house,lp,sv]);
+ out.pool=C.pool(market.publicKey).toBase58();out.house=house.publicKey.toBase58();out.price=C.DEFAULT_PARAMS.initial_price;
+ fs.writeFileSync(__dirname+'/m2-'+name+'.json',JSON.stringify(out,null,1));console.log(JSON.stringify(out));
+})().catch(e=>{console.error('ERR',e.message,(e.logs||[]).slice(-10).join('\n'));process.exit(1)});

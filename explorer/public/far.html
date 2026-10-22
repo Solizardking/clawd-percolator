@@ -1,0 +1,49 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>clawd far</title><link rel="icon" href="/logo.svg"><link rel="stylesheet" href="/style.css">
+<style>
+.hero h1{font-size:clamp(40px,6vw,64px);line-height:.95;margin:0 0 10px}
+.hero p{color:var(--dim);max-width:680px;margin:0}
+.scenes{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:22px 0}
+.scenes button{width:100%}
+.scenes .card p{color:var(--dim);min-height:4.5em;margin:8px 0 0}
+#notice{min-height:1.4em;color:var(--cy);margin:0 0 12px}
+.table-wrap{overflow:auto}
+#log{min-height:180px;white-space:pre-wrap}
+.step{display:flex;gap:10px;align-items:baseline;padding:6px 0;border-bottom:1px solid #1e1a33}
+.step b{min-width:9em}
+@media(max-width:860px){.scenes{grid-template-columns:1fr}}
+</style></head><body>
+<nav><a class="brand" href="/"><img src="/logo.svg" width="34" alt=""> clawd</a><span class="sp"></span><a href="/">Home</a><a href="/explorer">Explorer</a><a class="btn hot" href="https://explorer.clawdchain.trade/launchpad">Launchpad</a><a href="/launchpad" hidden>Launchpad</a><a href="https://percolator.clawdchain.trade/">Percolator</a><a class="on" href="/far">Far</a><a href="/readme">Wallet</a><a href="https://faucet.clawdchain.trade">Faucet</a><a href="https://api.clawdchain.trade">API</a><a href="https://github.com/Solizardking/clawd-chain">GitHub</a></nav>
+<div class="wrap">
+<section class="hero">
+<p class="kicker"><span class="dot"></span> far protocol</p>
+<h1>Run a <span class="glow">Far</span> block</h1>
+<p>Named accounts, scoped keys, two shards, and a solver intent. CLAWD pays for authentication, attestation, verification, and inference, and that charge is the block producer's reward. Signatures are FIPS 204 ML-DSA-65. This page runs the in-memory protocol on the explorer. It does not spend Agave CLAWD, and it is not NEAR mainnet.</p>
+</section>
+<p id="notice">Starting a session…</p>
+<div class="scenes">
+<div class="card"><h3 style="margin:0">Keys</h3><p>A scoped key may ping app.clawd. Another account, key, or method leaves every balance unchanged.</p><button class="btn hot" id="keys" type="button">Run keys</button></div>
+<div class="card"><h3 style="margin:0">Shards</h3><p>One shard's fee and full queue stay on that shard. A receipt applies entirely or rolls back. Inclusion is one confirmation.</p><button class="btn hot" id="shards" type="button">Run shards</button></div>
+<div class="card"><h3 style="margin:0">Intent</h3><p>Alice signs the balance changes and a deadline, with no route. Settlement applies only when every asset nets to zero.</p><button class="btn hot" id="intent" type="button">Run intent</button></div>
+<div class="card"><h3 style="margin:0">Mining</h3><p>Valid included model work debits the payer and credits the producer. Unpaid, invalid, or failed work pays nothing.</p><button class="btn hot" id="mine" type="button">Run mining</button></div>
+</div>
+<div class="actions" style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:16px">
+<button class="btn" id="all" type="button">Run all four</button>
+</div>
+<div class="grid g2">
+<div class="card"><h3 style="margin-top:0">Balances</h3><div class="table-wrap"><table><thead><tr><th>Account</th><th>CLAWD</th><th>WIDGET</th><th>Calls</th></tr></thead><tbody id="balances"><tr><td class="sub" colspan="4">Run a scene.</td></tr></tbody></table></div></div>
+<div class="card"><h3 style="margin-top:0">Latest result</h3><div id="log"></div></div>
+</div>
+<div class="card" style="margin-top:16px">
+<h3 style="margin-top:0">What the buttons call</h3>
+<div class="kv" id="facts">
+<div>Signatures</div><div>FIPS 204 ML-DSA-65, pure and hedged, context <code>clawd</code></div>
+<div>Shards</div><div>shard-0 and shard-1, each with its own fee and queue</div>
+<div>Intent</div><div>Signed diffs plus a deadline. Competing fills. No user gas balance</div>
+<div>Charges</div><div id="charges">authentication, attestation, verification, inference</div>
+</div>
+</div>
+</div>
+<footer>clawd far · in-memory demo · CLAWD has no monetary value · <a href="/readme">Wallet</a></footer>
+<script src="/far.js"></script>
+</body></html>

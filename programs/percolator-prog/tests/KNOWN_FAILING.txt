@@ -1,0 +1,131 @@
+# 2026-08-31 (#441) — 13 entries REMOVED because they now pass.
+#
+# Every tag87_* and x* entry below was quarantined as broken wiring. They were not
+# broken: they were reporting a real StakePool version skew. The wrapper pinned v3
+# while the crafts and the loaded percolator_stake.so disagreed, so the bind failed
+# with Custom(16) before any behaviour under test ran. Moving the wrapper to v4 and
+# rebuilding stake at origin/main d0c6ecb made all 13 pass unchanged — no test was
+# edited to fit, only the version constants they were always asserting about.
+#
+# The lesson: a quarantined test can be a FINDING that was filed as flakiness. When
+# a whole cluster fails at the same setup step, suspect the fixture contract, not
+# the tests.
+# Tests that CANNOT pass in this checkout, with the reason. CI is GREEN only when the
+# failing set matches this file EXACTLY -- a new failure is a regression, and an entry
+# that starts passing must be deleted here, so the list cannot silently rot.
+#
+# 2026-08-23: 567 passed / 34 failed, all sibling programs pinned to their DEPLOYED
+# commits. Pinning matters enormously -- the journey was:
+#
+#     no sibling BPFs at all ............ 515 passed /  86 failed
+#     all siblings at main .............. 546 /  55
+#     + matcher pinned to 585f492 ....... 560 /  41
+#     + nft pinned to f18da24 ........... 567 /  34
+#
+# 11 of those "failures" were matcher version drift alone: main's 33e1185 restored an
+# lp_pda.is_signer check (BUG-001) that the deployed 585f492 does not have.
+#
+# 2026-08-25: the matcher was redeployed 585f492 -> d4d4f1c (byte-verified) and the CI pin
+# moved with it. d4d4f1c CONTAINS the restored lp_pda.is_signer check, so those 11 tests
+# failed again -- 88 passed / 11 failed.
+#
+# 2026-08-26 CORRECTION AND FIX: I had recorded here that those 11 were "not fixable in this
+# checkout" because "the wrapper has NO instruction that CPIs matcher init". THAT WAS WRONG.
+# The wrapper has InitMatcherCtx (tag 83, handle_init_matcher_ctx at src/v16_program.rs:9166),
+# which derives the delegate PDA, marks it a signer in the CPI, and signs with invoke_signed.
+# Its own doc comment calls it "the only way to initialize a matcher context". It is in the
+# DEPLOYED wrapper 19d5d932 too, so the capability has been live on devnet throughout. I had
+# grepped for the matcher's spelling (InitVamm) and treated zero hits as proof of absence.
+#
+# The harness was calling the matcher's process_init DIRECTLY with is_signer=false, which only
+# ever worked against a matcher missing the BUG-001 check. It now goes through InitMatcherCtx,
+# i.e. the real on-chain path. Result: v16_cu = 98 passed / 1 failed, and ten entries were
+# deleted from this file rather than quarantined on a false premise.
+#
+# Remaining 34 (non-matcher), by cause:
+#
+#   19  sol_invoke_signed() not available            [STRUCTURAL - cannot be fixed here]
+#       tests/v16_wrapper.rs uses a native in-process run_ix/TestAccount harness with no
+#       BPF loader, so invoke_signed is a stubbed no-op. These paths need LiteSVM or a
+#       real validator. The file documents this itself around :18173.
+#
+#    9  v16_fee_split error-code mismatches          [UNDIAGNOSED - tracked]
+#       Expected operative code differs from observed (e.g. Custom(60) vs Custom(55)).
+#       Ruled OUT: stake version skew (retested against deployed 474079f, identical).
+#
+#    4  v16_five_program_crosscut                    [UNDIAGNOSED - tracked]
+#    2  v16_nft_e2e                                  [UNDIAGNOSED - tracked]
+#
+# Reducing this list is tracked work, not a licence to ignore failures.
+e2e::e2e_cross_portfolio_substitution_rejects
+e2e::e2e_direct_hook_invocation_rejects
+v16_wrapper_close_portfolio_rejects_non_empty_and_closes_empty
+v16_wrapper_close_slab_requires_admin_resolved_empty_market
+v16_wrapper_domain_withdrawals_reject_admin_before_shutdown_and_accept_secondary_mint
+v16_wrapper_fee_redirect_policy_is_admin_gated_and_trade_fees_bypass_domain_budgets
+v16_wrapper_insurance_ledger_tracks_topup_profit_loss_and_withdrawal
+v16_wrapper_insurance_policy_deposit_only_leaves_fee_growth_behind
+v16_wrapper_insurance_policy_enforces_bps_cap_and_cooldown
+v16_wrapper_maintenance_fee_is_permissionless_and_capital_capped
+v16_wrapper_maintenance_fee_policy_splits_optional_cranker_share
+v16_wrapper_non_main_domain_insurance_isolated_from_global_withdrawals
+v16_wrapper_permissionless_dynamic_market_drains_after_positions_close
+v16_wrapper_permissionless_market_shutdown_force_closes_recovers_and_reuses_slot
+v16_wrapper_resolved_insurance_authority_can_withdraw_all_remaining_insurance
+v16_wrapper_shutdown_admin_drain_timeout_ledgers_and_backing_earnings
+v16_wrapper_shutdown_asset_force_closes_drains_retires_and_reuses_slot
+v16_wrapper_underfunded_flat_sync_sweeps_remaining_capital_once
+v16_wrapper_update_asset_authority_rejects_after_resolve_to_freeze_terminal_claims
+v16_wrapper_withdraw_insurance_limited_is_live_only_and_terminal_uses_authority
+v16_wrapper_withdraw_insurance_requires_operator_and_healthy_market
+
+#    1  BatchTradeCpi 14-leg x 4-tail exceeds the CU ceiling  [REAL FINDING - tracked]
+#       v16_cu is now 98 passed / 1 failed. The other ten former entries here are FIXED:
+#       the harness used to call the matcher's process_init DIRECTLY with is_signer=false,
+#       which only works against a matcher missing the BUG-001 check. It now bootstraps the
+#       context through the wrapper's InitMatcherCtx (tag 83), which CPIs the matcher with
+#       the delegate PDA as signer via invoke_signed -- the real on-chain path, and per the
+#       instruction's own doc comment "the only way to initialize a matcher context".
+#
+#       The remaining failure is NOT matcher version drift: the archived 585f492 bytes fail
+#       it identically (consumed 1,399,676 of 1,399,700, "exceeded CUs"). With the context
+#       now carrying a correct lp_account_id, the matcher does real work on every fill
+#       instead of bailing early, so the batch genuinely executes 56 fills and runs out of
+#       compute. The test asserts "product 56 <= budget 64 must execute", so the declared
+#       fanout budget of 64 is optimistic against the 1.4M CU ceiling.
+
+# =========================================================================================
+# 2026-08-29 -- WHICH nft this baseline was measured against, and why that now matters.
+#
+# Every number in the header above (567 / 34, and the 88 / 11 and 98 / 1 for v16_cu) was
+# measured with the nft sibling pinned at f18da24. f18da24 is NOT what is deployed: devnet
+# runs cf56ba5 (= nft main), which reverted "accept wrapper VERSION 17" (ce6b051) and the
+# DhSkE7u allowlist entry (58911ab). So this file is the FIX-PIN baseline.
+#
+# ci.yml now runs the suite against BOTH pins (matrix `nft_pin`), and scripts/ci-test.sh
+# applies different rules to each:
+#
+#   NFT_PIN=fix       failing set must EQUAL this file. Unchanged from before; nothing here
+#                     is relaxed, and no entry was added for the deployed-nft fallout.
+#   NFT_PIN=deployed  failing set must be a strict SUPERSET of this file, with at least one
+#                     extra failure, every extra from a suite that mounts the nft .so.
+#
+# The deployed-pin extras are deliberately NOT listed here. Allowlisting them is what would
+# re-hide the on-chain defect; instead CI asserts the defect is present and visible, and
+# goes red the moment that stops being true (i.e. when the nft is redeployed with the fix).
+# See ci/deployed-refs.env and tests/KNOWN_PARITY_DIVERGENCE.txt.
+# =========================================================================================
+
+# =========================================================================================
+# 2026-08-29 -- v16_bpf_batch_trade_cpi_tail_fanout_budget_rejects_oversized_product REMOVED.
+#
+# It was quarantined because it asserted a 14-leg x 4-tail batch MUST EXECUTE. It never could:
+# a leg costs ~120,000 CU, so 12+ legs exhaust the 1.4M ceiling whatever the tail size. The
+# test was encoding the bug, not catching it.
+#
+# #436 fix: MATCHER_BATCH_MAX_LEGS lowered 16 -> 11 (the measured ceiling), so 12..=16 are now
+# refused up front instead of passing every declared check and dying on compute. The test is
+# rewritten to pin BOTH bounds and the boundary: 12 legs -> Custom(9) from the leg bound,
+# 11x6=66 -> Custom(9) from the product bound, 11x5 -> executes. It passes; it is not
+# allowlisted.
+# =========================================================================================

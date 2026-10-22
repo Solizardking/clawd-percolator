@@ -1,0 +1,136 @@
+<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>clawd launchpad</title><link rel="icon" href="/logo.svg"><link rel="stylesheet" href="/style.css">
+<style>
+.lp{display:grid;grid-template-columns:1.1fr .9fr;gap:18px;align-items:start}
+.lt{width:100%;border-collapse:collapse;font-size:14px}.lt th,.lt td{text-align:left;padding:8px 10px;border-bottom:1px solid rgba(255,255,255,.08);white-space:nowrap}.lt th{color:var(--dim);font-size:12px;text-transform:uppercase}.lptabs{display:flex;gap:8px;align-items:center;margin:8px 0 14px}
+.lp h1{font-size:42px;line-height:1.05;margin:0 0 8px}
+.row{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+label{display:block;color:var(--dim);font-size:12px;font-weight:700;letter-spacing:1px;text-transform:uppercase;margin:12px 0 6px}
+.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}
+#notice,#dbc-notice,#clawdium-notice{min-height:1.4em;margin:10px 0 0;color:var(--cy)}
+select{background:#0b0a15;border:1px solid var(--line);border-radius:12px;color:var(--txt);padding:12px 14px;font:inherit;outline:none;width:100%}
+.dbc,.clawdium{margin-top:28px}
+.dbc h2,.clawdium h2{font-size:36px;line-height:1.05;margin:0 0 8px}
+@media(max-width:860px){.lp,.row{grid-template-columns:1fr}.lp h1{font-size:32px}.dbc h2,.clawdium h2{font-size:28px}}
+</style></head><body>
+<nav><a class="brand" href="https://clawdchain.trade/"><img src="/logo.svg" width="34" alt=""> clawd</a><span class="sp"></span><a href="https://clawdchain.trade/">Home</a><a href="https://explorer.clawdchain.trade/explorer">Explorer</a><a class="btn hot" href="https://launch.clawdchain.trade/">Launchpad</a><a href="/launchpad" hidden>Launchpad</a><a href="https://percolator.clawdchain.trade/">Percolator</a><a href="https://faucet.clawdchain.trade">Faucet</a><a href="https://shield.clawdchain.trade">Shield</a><a href="https://clawdchain.trade/far">Far</a><a href="https://clawdchain.trade/readme">Wallet</a><a href="https://payments.clawdchain.trade">Payments</a><a href="https://mint.clawdchain.trade">Mint</a><a href="https://api.clawdchain.trade">API</a><a href="https://github.com/Solizardking/clawd-chain">GitHub</a></nav>
+<div class="wrap"><div class="lptabs"><a href="#onchain" data-t="onchain" class="btn hot">📒 On-chain launches</a> <a href="#paper" data-t="paper" class="btn">🧪 Paper curve</a> <span class="sub" style="margin-left:8px">testnet, unaudited</span></div></div>
+<div class="wrap" id="tab-onchain"><div class="card"><h2 style="margin:0 0 6px">Every coin launched on clawd chain</h2><p class="sub" id="lcount">loading…</p><div style="overflow-x:auto"><table class="lt"><thead><tr><th>Coin</th><th>Creator</th><th>Created</th><th>Raised</th><th>Curve</th><th>Trades</th><th>Volume</th><th>Status</th></tr></thead><tbody id="lrows"></tbody></table></div><p class="sub">Launch and trade on-chain at <a href="https://clawd-launch-production.up.railway.app/">the on-chain app</a> · get 100 test CLAWD from the <a href="https://faucet.clawdchain.trade">faucet</a>. Testnet coins, no value.</p></div></div>
+<div class="wrap" id="tab-paper">
+<div class="lp">
+<div>
+<p class="sub">Paper curve · in-browser simulation · nothing is sent on-chain</p>
+<h1>Launch a <span class="glow">coin</span></h1>
+<p style="color:var(--dim);max-width:560px">Each coin opens its own curve. 1,000,000,000 supply, 793,100,000 sellable, 206,900,000 held back. Virtual reserves start at 30 CLAWD and 1,073,000,000 tokens. Real CLAWD starts at 0. The curve closes once the sellable inventory is gone and seeds an AMM with the real CLAWD plus the held-back tokens.</p>
+<div class="card">
+<label for="name">Name</label>
+<input id="name" name="name" autocomplete="off" placeholder="Coin name">
+<label for="symbol">Symbol</label>
+<input id="symbol" name="symbol" autocomplete="off" placeholder="SYMBOL" maxlength="12">
+<div class="actions"><button class="btn hot" id="create" type="button">Create coin</button></div>
+</div>
+<div class="card" style="margin-top:16px">
+<div class="row">
+<div><label for="amount">Buy CLAWD</label><input id="amount" name="amount" value="1" inputmode="decimal"></div>
+<div><label for="tokens">Sell tokens</label><input id="tokens" name="tokens" value="1000" inputmode="numeric"></div>
+</div>
+<div class="actions">
+<button class="btn hot" id="buy" type="button">Buy</button>
+<button class="btn" id="sell" type="button">Sell</button>
+</div>
+<p id="notice"></p>
+</div>
+</div>
+<div class="grid" style="gap:16px">
+<div class="card stat"><div class="k">Phase</div><div class="v" id="phase">no coin</div><div class="sub" id="status">Create a coin to open its curve.</div></div>
+<div class="card stat"><div class="k">Spot market cap</div><div class="v" id="price">—</div><div class="sub">virtual CLAWD / virtual tokens, on the full supply</div></div>
+<div class="card stat"><div class="k">Real reserve</div><div class="v" id="reserve">—</div><div class="sub">CLAWD that has entered the invariant</div></div>
+<div class="grid g2">
+<div class="card stat"><div class="k">Supply</div><div class="v" id="supply">—</div></div>
+<div class="card stat"><div class="k">Sellable left</div><div class="v" id="sellable">—</div></div>
+<div class="card stat"><div class="k">Your tokens</div><div class="v" id="held">—</div></div>
+<div class="card stat"><div class="k">Your CLAWD</div><div class="v" id="balance">—</div></div>
+</div>
+</div>
+</div>
+</div>
+<section class="dbc">
+<p class="sub">Deeper liquidity · sqrt-price curve · fees and rewards on the swap · clawd AMM</p>
+<h2>Open a <span class="glow">pool</span></h2>
+<p style="color:var(--dim);max-width:720px">This pool is separate from the paper CLAWD coin. Virtual liquidity quotes the price and real quote starts at 0. A trader reward is credited on the swap and can be claimed immediately. When the curve fills, a keeper migrates the real reserves into a clawd AMM. In-browser quote, no mainnet deployment, no monetary value.</p>
+<div class="lp">
+<div>
+<div class="card">
+<label for="dbc-name">Pool name</label>
+<input id="dbc-name" name="dbc-name" autocomplete="off" placeholder="Pool name">
+<label for="dbc-symbol">Symbol</label>
+<input id="dbc-symbol" name="dbc-symbol" autocomplete="off" placeholder="SYMBOL" maxlength="12">
+<label for="dbc-style">Curve</label>
+<select id="dbc-style" name="dbc-style">
+<option value="opening">Opening · fixed 1%</option>
+<option value="countdown">Countdown · 10% to 1%</option>
+<option value="shield">Shield · exponential 10%</option>
+</select>
+<div class="actions"><button class="btn hot" id="dbc-create" type="button">Create pool</button></div>
+</div>
+<div class="card" style="margin-top:16px">
+<label for="dbc-amount">Size</label>
+<input id="dbc-amount" name="dbc-amount" value="1" inputmode="decimal">
+<div class="actions">
+<button class="btn hot" id="dbc-buy" type="button">Buy base</button>
+<button class="btn" id="dbc-sell" type="button">Sell base</button>
+<button class="btn" id="dbc-migrate" type="button">Migrate</button>
+<button class="btn" id="dbc-claim" type="button">Claim reward</button>
+</div>
+<p id="dbc-notice"></p>
+</div>
+</div>
+<div class="grid" style="gap:16px">
+<div class="card stat"><div class="k">Phase</div><div class="v" id="dbc-phase">no pool</div><div class="sub" id="dbc-status">Create a pool to open its curve.</div></div>
+<div class="card stat"><div class="k">Fee</div><div class="v" id="dbc-fee">—</div><div class="sub">base fee now, capped at 99%</div></div>
+<div class="card stat"><div class="k">Quote reserve</div><div class="v" id="dbc-reserve">—</div><div class="sub">quote that entered the curve</div></div>
+<div class="card stat"><div class="k">Your reward</div><div class="v" id="dbc-reward">—</div><div class="sub">credited on the swap</div></div>
+</div>
+</div>
+</section>
+<section class="clawdium">
+<p class="sub">Clawdium · constant-product pool · 0.25% fee · paper CLAWD</p>
+<h2>Swap on <span class="glow">Clawdium</span></h2>
+<p style="color:var(--dim);max-width:720px">Clawdium is a separate in-browser constant-product pool. The 0.25% trade fee splits 12% to the protocol, 4% to the fund, and the rest to LPs. Paper CLAWD is the quote. This pool is not a mainnet deployment and CLAWD has no monetary value.</p>
+<div class="lp">
+<div>
+<div class="card">
+<label for="clawdium-name">Pool name</label>
+<input id="clawdium-name" name="clawdium-name" autocomplete="off" placeholder="Pool name">
+<label for="clawdium-symbol">Symbol</label>
+<input id="clawdium-symbol" name="clawdium-symbol" autocomplete="off" placeholder="SYMBOL" maxlength="12">
+<div class="actions"><button class="btn hot" id="clawdium-create" type="button">Open pool</button></div>
+</div>
+<div class="card" style="margin-top:16px">
+<label for="clawdium-amount">Size</label>
+<input id="clawdium-amount" name="clawdium-amount" value="1" inputmode="decimal">
+<div class="actions">
+<button class="btn hot" id="clawdium-swap-in" type="button">Swap in</button>
+<button class="btn" id="clawdium-swap-out" type="button">Swap out</button>
+</div>
+<p id="clawdium-notice"></p>
+</div>
+</div>
+<div class="grid" style="gap:16px">
+<div class="card stat"><div class="k">Phase</div><div class="v" id="clawdium-phase">no pool</div><div class="sub" id="clawdium-status">Open a pool to quote a swap.</div></div>
+<div class="card stat"><div class="k">Fee</div><div class="v" id="clawdium-fee">—</div><div class="sub">12% protocol, 4% fund, rest to LPs</div></div>
+<div class="grid g2">
+<div class="card stat"><div class="k">Quote reserve</div><div class="v" id="clawdium-reserve">—</div><div class="sub">CLAWD on the curve</div></div>
+<div class="card stat"><div class="k">Price</div><div class="v" id="clawdium-price">—</div><div class="sub">CLAWD per base token</div></div>
+<div class="card stat"><div class="k">Your LP</div><div class="v" id="clawdium-lp">—</div><div class="sub">liquidity minted to you</div></div>
+</div>
+</div>
+</div>
+</section>
+<footer>clawd launchpad · in-browser curve · CLAWD has no monetary value</footer>
+<script src="/chain/market.js"></script>
+<script src="/chain/dbc.js"></script>
+<script src="/chain/clawdium.js"></script>
+<script src="/launchpad.js"></script>
+<script src="/launches.js"></script>
+<script src="/pv.js" data-site="launchpad" defer></script></body></html>

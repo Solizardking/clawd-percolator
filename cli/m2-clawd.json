@@ -1,0 +1,15 @@
+{
+ "name": "clawd",
+ "mint": "wDaoGBf5ShujJjwK6ALiSzBLU289KjHQ8J2SsQNcSn6",
+ "market": "39N7u5CW6X8VPT5sdfRra6RCdrddQ8BDp2r6hMCdrd9w",
+ "initSig": "5C8XmB49uAfKB7PAvn22F8PUJVBTAWNrXVpFoLvYpUJD5cXQbgzbWgtShMT6o9LS313m6PMQ2R1v4N5e5EAmD3Q6",
+ "vault": "Xp6HnDKjCmBcUvUctutUsumEnGjFbPbYvrbMzKdc6H1",
+ "nftRegistrySig": "4DivB5ogAg1KHbv3HkGkYkU2eHqL1onT2HRbx2eRvLqDtRTXT57hA3xgzT2YMDsEhsyf7btgRF7mAfswzk5x8Wjo",
+ "housePortfolio": "CGywxbqJN9JJVymuN97zgoVmAk5mnMnhRKdLRjej6yQb",
+ "lpMint": "HCqVxVHtHfuJsEh4E7PwfYzTjvXHgA2qkok18WduiHAS",
+ "stakeVault": "6V3B1mu87wwvCdevbY8EfW3viyh7Sg68YHKbxuYssALh",
+ "poolSig": "2xEQpuB3B6btrpUym4M4h87oxtLeHv9oSNRz28dscQixkTUkDS9h6dCtTSPZ3WHjkNcX9EKwe9chom3Rk87Ec74y",
+ "pool": "5akZTewPHpjR9cseP8DpvSxtW6MUmfktanHzSf1TpZHV",
+ "house": "D7nvng9ir7DDfyv1t6VPhezuf8n3L91b4Kf57QrgHfY6",
+ "price": 100000000
+}

@@ -1,0 +1,13 @@
+node_modules/
+target/
+*.so
+.keys/
+*keypair*.json
+.env
+.env.*
+!env.example
+data/
+*.log
+*.tgz
+._*
+.DS_Store

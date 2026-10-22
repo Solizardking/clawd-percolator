@@ -1,0 +1,1325 @@
+use solana_program::program_error::ProgramError;
+
+/// Instructions for the Percolator Insurance LP Staking program.
+///
+/// The stake program handles deposits, withdrawals, LP math, insurance flush/return,
+/// fee accrual, HWM, and tranches.
+///
+/// DOC CORRECTION (security review C-1, issue #6 lineage): earlier versions of this
+/// file described the human admin as calling ALL wrapper admin operations
+/// (ResolveMarket, SetOracleAuthority, WithdrawInsurance, etc.) directly on the
+/// wrapper, with "no admin proxy needed". That was true only before `InitPool`
+/// grew the `cpi_update_authority` (wrapper tag 32) call that rotates
+/// `cfg.marketauth` to this program's pool PDA (ported from the deployed
+/// `percolator-vault@eb3ebe8`). Once marketauth is a PDA, the human admin can NO
+/// LONGER call any marketauth-gated wrapper instruction directly — a PDA cannot
+/// sign a top-level transaction, so every such call must be proxied through a CPI
+/// this program issues via `invoke_signed`. `ResolveMarket` (wrapper tag 19,
+/// proxied here as `AdminResolveMarket`, tag 24) was the first such proxy;
+/// without it every InitPool market would be permanently stuck in Live mode.
+///
+/// TASK 13 (2026-07-20): the proxy set is extended from one to five. Two
+/// DISTINCT signers are involved and they must never be conflated:
+///
+/// GROUP A — gated on `cfg.marketauth`, signed by the POOL PDA
+/// (`[b"stake_pool", slab, bump]`), exactly as `AdminResolveMarket` does:
+///
+/// ```text
+///   tag 25 AdminUpdateFeeSplit               -> wrapper tag 86
+///   tag 26 AdminUpdateMaintenanceFeePerSlot  -> wrapper tag 88
+/// ```
+///
+/// GROUP B — gated on the per-asset `insurance_authority`, signed by the
+/// VAULT_AUTH PDA (`[b"vault_auth", pool, bump]`) that
+/// `BindInsuranceAuthority` (tag 19) installs into asset 0's profile:
+///
+/// ```text
+///   tag 27 AdminUpdateBackingFeePolicy  -> wrapper tag 51
+///   tag 28 AdminUpdateTradeFeePolicy    -> wrapper tag 55
+/// ```
+///
+/// Group B RESTORES a capability rather than transferring one: before the bind,
+/// tags 51/55 are callable directly by whoever holds `insurance_authority` (the
+/// creator, by default). After the bind, the holder is a PDA and only these
+/// proxies can reach them. Tag 51 is the setter for `backing_trade_fee_bps` —
+/// without this proxy, a staked market's backing fee can never be set by
+/// anyone, which is the mechanical root of the "fee split is unachievable"
+/// finding.
+///
+/// NOT PROXYABLE — wrapper tag 69 `RestartAssetOracle`. It is gated on the
+/// per-asset `asset_admin`, and this program moves `asset_admin` to exactly one
+/// place: `[0u8; 32]`, via `BurnAssetAdmin` (tag 21). It is never rotated to
+/// `vault_auth` or to the pool PDA. The wrapper's gate is
+/// `expect_live_authority`, whose `live_authority_matches` helper requires
+/// `expected != [0u8; 32]` — so a burned `asset_admin` matches NO signer, PDA
+/// or otherwise. The two reachable states are therefore:
+///
+/// - pre-burn: `asset_admin == pool.admin`, a real keypair — the admin calls
+///   wrapper tag 69 DIRECTLY and needs no proxy;
+/// - post-burn: `asset_admin == [0;32]` — tag 69 is unreachable by every key in
+///   existence, and a proxy signing as `vault_auth` would fail `Unauthorized`
+///   just like anything else.
+///
+/// A tag-69 proxy would be dead code in both states, so none is shipped.
+/// Restoring tag 69 post-burn would require a wrapper change (out of scope) —
+/// see `tests/task13_cpi_proxies_e2e.rs::tag69_restart_asset_oracle_is_not_proxyable`,
+/// which pins this reasoning against the real wrapper bytecode.
+///
+/// Remaining marketauth-gated wrapper operations not listed above are still
+/// UNREACHABLE through this program and must be proxied here before they can
+/// ever be exercised on an InitPool market.
+#[derive(Debug)]
+pub enum StakeInstruction {
+    /// 0: Initialize a stake pool for a slab (market).
+    ///
+    /// Accounts:
+    ///   0. `[signer, writable]` Admin (pays rent, becomes pool admin)
+    ///   1. `[writable]` Slab account (the percolator market; written by the
+    ///      marketauth admin-handoff CPI — `process_init_pool` rejects a read-only slab)
+    ///   2. `[writable]` Pool PDA (stake_pool, to be created)
+    ///   3. `[writable]` LP Mint (to be created, authority = vault_auth PDA)
+    ///   4. `[writable]` Vault token account (to be created, authority = vault_auth PDA)
+    ///   5. `[]` Vault authority PDA
+    ///   6. `[]` Collateral mint
+    ///   7. `[]` Percolator program ID
+    ///   8. `[]` Token program
+    ///   9. `[]` System program
+    ///  10. `[]` Rent sysvar
+    InitPool {
+        cooldown_slots: u64,
+        deposit_cap: u64,
+    },
+
+    /// 1: Deposit collateral into the stake vault. Mints LP tokens pro-rata.
+    ///
+    /// Accounts:
+    ///   0. `[signer]` User depositing
+    ///   1. `[writable]` Pool PDA
+    ///   2. `[writable]` User's collateral token account (source)
+    ///   3. `[writable]` Pool vault token account (destination)
+    ///   4. `[writable]` LP mint (to mint LP tokens)
+    ///   5. `[writable]` User's LP token account (receives LP tokens)
+    ///   6. `[]` Vault authority PDA (mint authority)
+    ///   7. `[writable]` Deposit PDA (per-user, created if needed)
+    ///   8. `[]` Token program
+    ///   9. `[]` Clock sysvar
+    ///  10. `[]` System program
+    ///  11. `[]` Wrapper market (`pool.slab`). #290: REQUIRED when the pool is
+    ///      mode 0 (every `InitPool` pool), because it supplies the tag-87 fee-payout
+    ///      counter that pending fees are attributed against before pricing. Ignored
+    ///      for mode 1.
+    Deposit { amount: u64 },
+
+    /// 2: Withdraw collateral by burning LP tokens. Subject to cooldown.
+    ///
+    /// Accounts:
+    ///   0. `[signer]` User withdrawing
+    ///   1. `[writable]` Pool PDA
+    ///   2. `[writable]` User's LP token account (source, tokens burned)
+    ///   3. `[writable]` LP mint (to burn)
+    ///   4. `[writable]` Pool vault token account (source of collateral)
+    ///   5. `[writable]` User's collateral token account (destination)
+    ///   6. `[]` Vault authority PDA (transfer authority)
+    ///   7. `[writable]` Deposit PDA (per-user, cooldown check)
+    ///   8. `[]` Token program
+    ///   9. `[]` Clock sysvar
+    ///  10. `[]` OPTIONAL wrapper market (`pool.slab`). #290: when present on a mode-0
+    ///      pool, pending wrapper-paid fees are accrued before pricing the redemption.
+    ///      When absent, that accrual is skipped, so the withdrawer redeems at the
+    ///      not-yet-accrued (lower or equal) price. Clients should always pass it.
+    Withdraw { lp_amount: u64 },
+
+    /// 3: CPI into percolator wrapper's TopUpInsurance to move collateral from
+    /// stake vault → wrapper insurance fund.
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Caller (admin-only per C10 fix)
+    ///   1. `[writable]` Pool PDA
+    ///   2. `[writable]` Pool vault token account (source)
+    ///   3. `[]` Vault authority PDA (signs CPI)
+    ///   4. `[writable]` Slab account
+    ///   5. `[writable]` Wrapper vault token account (destination)
+    ///   6. `[]` Percolator program
+    ///   7. `[]` Token program
+    FlushToInsurance { amount: u64 },
+
+    /// 19: BindInsuranceAuthority — ONE-TIME bind of the v16 market's
+    /// `insurance_authority` to our `vault_auth` PDA, so FlushToInsurance (which
+    /// signs as that PDA) passes v16's authority gate. CPIs the wrapper's
+    /// UpdateAuthority(INSURANCE, vault_auth_pda): the admin co-signs as the
+    /// current authority and the PDA co-signs via invoke_signed as the new
+    /// authority — the only way to bind a PDA (a plain admin tx can't, because the
+    /// wrapper requires the new authority to sign and a PDA cannot sign directly).
+    /// Must be called once after market creation, before the first flush. Fails
+    /// (wrapper Unauthorized) if the admin is no longer the current authority
+    /// (i.e. already bound), making it naturally single-use — PROVIDED the
+    /// market is still Live (mode == 0). The wrapper's
+    /// `handle_update_asset_authority` checks `group.header.mode != 0` BEFORE
+    /// the authority check (v16_program.rs:10362-10364), so if the market has
+    /// since been resolved (e.g. via `AdminResolveMarket`, tag 24) a repeat or
+    /// late call fails with EngineLockActive instead, not Unauthorized.
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Admin (current insurance_authority; must equal pool.admin)
+    ///   1. `[]` Pool PDA
+    ///   2. `[]` Vault authority PDA (the new authority; signed via CPI)
+    ///   3. `[writable]` Slab / market account (wrapper-owned)
+    ///   4. `[]` Percolator program
+    BindInsuranceAuthority,
+
+    /// 20: RotateInsuranceAuthority — admin-gated migration/incident primitive
+    /// that moves the market's `insurance_authority` OFF our `vault_auth` PDA to an
+    /// admin-specified `new_target`. CPIs UpdateAuthority(INSURANCE, new_target)
+    /// with the PDA signing as the CURRENT authority (invoke_signed) and new_target
+    /// co-signing the outer tx as the NEW authority. This is the ESCAPE from the
+    /// otherwise-permanent bind: without it, a stake redeploy to a new program id
+    /// would orphan insurance_authority on the dead program and brick the flush.
+    /// Migration: rotate to the admin wallet from the OLD program before
+    /// decommissioning it, then re-bind from the NEW program before BurnAssetAdmin.
+    /// Only works while the PDA is the current authority and before the final burn.
+    /// It ALSO only works while the market is still Live (mode == 0): the wrapper's
+    /// `handle_update_asset_authority` rejects with EngineLockActive (checked
+    /// before the authority match) once the market has been resolved — a
+    /// mode-related rejection is EngineLockActive, not Unauthorized, even though
+    /// both this and an authority mismatch surface as CPI failures from stake's
+    /// perspective. Migrate BEFORE resolving, not after.
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Admin (must equal pool.admin — the stake-side gate)
+    ///   1. `[]` Pool PDA
+    ///   2. `[]` Vault authority PDA (the CURRENT authority; signed via CPI)
+    ///   3. `[signer]` New target authority (the successor; co-signs the outer tx)
+    ///   4. `[writable]` Slab / market account (wrapper-owned)
+    ///   5. `[]` Percolator program
+    RotateInsuranceAuthority,
+
+    /// 21: BurnAssetAdmin — irrevocably remove the admin's rotate-back capability.
+    /// Calls UpdateAssetAuthority(kind=0, new_pubkey=[0;32]) to burn asset_admin to
+    /// zero. After this, no key can rotate any per-asset authority (insurance,
+    /// operator, backing, oracle) back to an admin-controlled key through stake.
+    /// Stake also records the burn and disables its PDA-signed rotate escapes.
+    ///
+    /// IRREVERSIBLE. Only call this after BindInsuranceAuthority has completed.
+    /// Must NOT be called again if asset_admin is already zero — this causes
+    /// Unauthorized ONLY while the market is still Live (mode == 0). The wrapper's
+    /// `handle_update_asset_authority` checks `group.header.mode != 0` before the
+    /// authority check, so calling this after the market has been resolved (e.g.
+    /// via `AdminResolveMarket`, tag 24) fails with EngineLockActive instead,
+    /// regardless of whether asset_admin was already burned.
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Admin (current asset_admin == pool.admin)
+    ///   1. `[writable]` Pool PDA
+    ///   2. `[]` Vault authority PDA (placeholder new_authority slot — not checked for burn)
+    ///   3. `[writable]` Slab / market account (wrapper-owned)
+    ///   4. `[]` Percolator program
+    BurnAssetAdmin,
+
+    /// 22: RotateInsuranceOperator — admin-gated migration escape for the
+    /// insurance_operator. Analogous to RotateInsuranceAuthority (tag 20) but for
+    /// kind=2 (ASSET_AUTH_INSURANCE_OPERATOR). The vault_auth PDA signs as the
+    /// CURRENT operator (invoke_signed); new_target co-signs the outer tx.
+    ///
+    /// Part of the full no-lockout migration sequence, before final burn:
+    ///   1. RotateInsuranceAuthority (tag 20): authority PDA → admin wallet
+    ///   2. RotateInsuranceOperator  (tag 22): operator  PDA → admin wallet
+    ///   3. Re-bind from NEW program (BindInsuranceAuthority, tag 19)
+    ///   4. BurnAssetAdmin (tag 21) when the new bind is final
+    ///
+    /// Same mode caveat as RotateInsuranceAuthority (tag 20): only works while the
+    /// market is Live (mode == 0). Post-resolution the wrapper CPI fails with
+    /// EngineLockActive, not Unauthorized — migrate before resolving.
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Admin (must equal pool.admin — the stake-side gate)
+    ///   1. `[]` Pool PDA
+    ///   2. `[]` Vault authority PDA (the CURRENT operator; signed via CPI)
+    ///   3. `[signer]` New target operator (co-signs the outer tx)
+    ///   4. `[writable]` Slab / market account (wrapper-owned)
+    ///   5. `[]` Percolator program
+    RotateInsuranceOperator,
+
+    /// 23: RecoverFlushedInsurance — PDA-signed permissionless recovery of
+    /// tokens from the wrapper's insurance fund back to the stake pool vault.
+    ///
+    /// After BurnAssetAdmin (tag 21) the admin cannot rotate the insurance_operator
+    /// back to any key it controls, making the stake program the sole path for
+    /// moving insurance tokens out of the wrapper. This instruction issues a CPI
+    /// to wrapper tag 57 `WithdrawInsuranceAsset` — which gates on
+    /// insurance_operator == operator (the vault_auth PDA, set by
+    /// BindInsuranceAuthority tag 19) — and deposits the tokens directly into
+    /// pool.vault. `pool.total_returned` is incremented by `amount` on success,
+    /// maintaining the conservation invariant total_returned <= total_flushed.
+    ///
+    /// PERMISSIONLESS: any caller may trigger recovery; funds can only land in
+    /// pool.vault (the DRAIN CHECK below guarantees this). This survives
+    /// BurnAssetAdmin because tag 57 gates on insurance_operator, not asset_admin.
+    ///
+    /// DRAIN CHECK: the CPI dest_token is verified to equal pool.vault BEFORE
+    /// the CPI is issued, preventing any redirection of recovered tokens.
+    ///
+    /// CAP: `amount` must be non-zero and <= (total_flushed - total_returned);
+    /// the instruction early-rejects if outstanding == 0 (nothing to recover).
+    ///
+    /// Accounts:
+    ///   0. `[]` Caller (permissionless — no signer check required)
+    ///   1. `[writable]` Pool PDA
+    ///   2. `[writable]` Pool vault token account (destination = pool.vault)
+    ///   3. `[]` Vault authority PDA (the insurance_operator; signs via invoke_signed)
+    ///   4. `[writable]` Wrapper market account (the slab)
+    ///   5. `[writable]` Wrapper vault token account (source, insurance fund)
+    ///   6. `[]` Wrapper vault authority PDA
+    ///   7. `[]` Token program
+    ///   8. `[]` Percolator program
+    RecoverFlushedInsurance { amount: u64 },
+
+    /// 4: Admin updates pool configuration.
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Admin
+    ///   1. `[writable]` Pool PDA
+    UpdateConfig {
+        new_cooldown_slots: Option<u64>,
+        new_deposit_cap: Option<u64>,
+    },
+
+    /// 5: ProposeAdmin — step 1 of two-step admin rotation. The CURRENT admin
+    /// proposes a new admin, written to pool.pending_admin. The proposed admin
+    /// does not gain any authority until they call AcceptAdmin (step 2).
+    /// Proposing the zero pubkey CANCELS an outstanding proposal.
+    ///
+    /// This safe ownership-transfer idiom (propose + accept) prevents handing the
+    /// pool to a key nobody controls (a one-step transfer to a typo'd address
+    /// would permanently brick admin operations on a real-money insurance vault).
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Current admin
+    ///   1. `[writable]` Pool PDA
+    ProposeAdmin { new_admin: [u8; 32] },
+
+    /// 6: AcceptAdmin — step 2 of two-step admin rotation. The PENDING admin
+    /// (the proposed new admin) signs to take ownership: pool.admin =
+    /// pool.pending_admin, then pending_admin is cleared. Requires an outstanding
+    /// proposal (pending_admin != 0) and the signer to equal pending_admin.
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Pending admin (the proposed new admin)
+    ///   1. `[writable]` Pool PDA
+    AcceptAdmin,
+
+    /// 7: ProposeCooldownIncrease — step 1 of the #242 cooldown-increase timelock.
+    /// The admin proposes a NEW (larger) `cooldown_slots`; it does not take effect until
+    /// CommitCooldownIncrease is called after TIMELOCK_SLOTS (≈48h), guaranteeing LP
+    /// holders an exit window. A decrease/unchanged value is rejected here (use
+    /// UpdateConfig, which applies decreases immediately).
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Admin
+    ///   1. `[writable]` Pool PDA
+    ///   2. `[]` Clock sysvar
+    ProposeCooldownIncrease { new_cooldown_slots: u64 },
+
+    /// 8: CommitCooldownIncrease — step 2 of the #242 timelock. Applies the pending
+    /// cooldown increase, but only after TIMELOCK_SLOTS have elapsed since the proposal.
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Admin
+    ///   1. `[writable]` Pool PDA
+    ///   2. `[]` Clock sysvar
+    CommitCooldownIncrease,
+
+    /// 9: CancelCooldownIncrease — withdraw an outstanding #242 cooldown proposal.
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Admin
+    ///   1. `[writable]` Pool PDA
+    CancelCooldownIncrease,
+
+    // Tag 11 removed: was an admin CPI proxy (SetInsurancePolicy). Human admin now
+    // calls the wrapper directly. Tags 5/6 reclaimed for admin rotation; tags 7/8/9
+    // reclaimed for the #242 cooldown-increase timelock.
+    /// 10: Return insurance funds to the pool vault.
+    /// Admin calls WithdrawInsurance on the wrapper directly (gets USDC to admin ATA),
+    /// then calls this to transfer from admin ATA to pool vault and update accounting.
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Admin
+    ///   1. `[writable]` Pool PDA
+    ///   2. `[writable]` Admin's collateral token account (source)
+    ///   3. `[writable]` Pool vault token account (destination)
+    ///   4. `[]` Token program
+    ReturnInsurance { amount: u64 },
+
+    /// 12: Accrue trading fees from percolator engine to LP vault.
+    /// Permissionless — anyone can trigger.
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Caller (permissionless)
+    ///   1. `[writable]` Pool PDA
+    ///   2. `[]` Pool vault token account (read balance)
+    ///   3. `[]` Clock sysvar
+    ///   4. `[]` Wrapper market (`pool.slab`). #290: REQUIRED for mode 0, ignored
+    ///      for mode 1. A mode-0 pool books vault surplus only up to the wrapper's
+    ///      not-yet-booked `insurance_reserve_withdrawn_atoms` (tag-87 payouts). Any
+    ///      other surplus (a raw donation) stays unpriced in the vault.
+    AccrueFees,
+
+    /// 13: Initialize pool in trading LP mode (pool_mode = 1).
+    ///
+    /// Accounts: same as InitPool
+    InitTradingPool {
+        cooldown_slots: u64,
+        deposit_cap: u64,
+    },
+
+    /// 14: Set high-water mark configuration.
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Admin
+    ///   1. `[writable]` Pool PDA
+    AdminSetHwmConfig { enabled: bool, hwm_floor_bps: u16 },
+
+    /// 15: Enable/configure senior-junior LP tranches.
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Admin
+    ///   1. `[writable]` Pool PDA
+    AdminSetTrancheConfig { junior_fee_mult_bps: u16 },
+
+    /// 16: Deposit into the junior (first-loss) tranche.
+    ///
+    /// Accounts: same as Deposit, including the #290 wrapper market at index 11.
+    DepositJunior { amount: u64 },
+
+    /// 18: Admin marks the pool as market-resolved (blocks new deposits).
+    /// Call this after resolving the market via `AdminResolveMarket` (tag 24) —
+    /// NOT directly on the wrapper; see that instruction's doc for why the human
+    /// admin can no longer call the wrapper's ResolveMarket directly once InitPool
+    /// has rotated marketauth to the pool PDA.
+    ///
+    /// H-1 GATE (security review, RE-REVIEW FIX): rejects with
+    /// `StakeError::InsuranceLossOutstanding` unless `pool.total_flushed <=
+    /// pool.total_recovered_from_wrapper` — defense-in-depth mirroring the same
+    /// gate on `AdminResolveMarket`. `AdminResolveMarket` is the instruction that
+    /// actually flips the wrapper to a non-Live mode and is the primary
+    /// enforcement point; this local bookkeeping flag is gated identically so a
+    /// market can never be marked resolved here while insurance recovery is
+    /// still outstanding, regardless of call order.
+    ///
+    /// Gated on `total_recovered_from_wrapper`, NOT `total_returned`: the latter
+    /// is also incremented by `ReturnInsurance` (tag 10 — admin's own wallet
+    /// tokens transferred into pool.vault, no wrapper CPI) and the #161
+    /// last-junior-exit phantom write-off (zero token movement). Either of those
+    /// would let an admin satisfy a `total_returned`-based gate WITHOUT actually
+    /// recovering the flushed capital from the wrapper, permanently stranding it
+    /// post-resolution. `total_recovered_from_wrapper` is incremented ONLY by
+    /// `RecoverFlushedInsurance` (tag 23), after its wrapper CPI succeeds.
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Admin
+    ///   1. `[writable]` Pool PDA
+    SetMarketResolved,
+
+    /// 24: AdminResolveMarket — CPI proxy for the wrapper's ResolveMarket (tag 19).
+    ///
+    /// C-1 FIX (security review BLOCKER): `InitPool` rotates `cfg.marketauth` to
+    /// this pool's PDA (see `cpi::cpi_update_authority`, ported from the deployed
+    /// `percolator-vault@eb3ebe8`). After that rotation the human admin can no
+    /// longer call the wrapper's ResolveMarket directly — the wrapper's
+    /// `expect_live_authority(&cfg.marketauth, admin.key)` check requires the
+    /// SIGNER to equal `cfg.marketauth`, which is now this program's pool PDA, and
+    /// a PDA cannot sign a top-level transaction. Without this proxy, NO key could
+    /// ever resolve a stake-initialized market: every InitPool market would be
+    /// permanently stuck in Live mode (mode == 0), with the terminal insurance
+    /// withdrawal path unreachable forever. This instruction lets the pool admin
+    /// trigger the CPI, with the pool PDA signing via `invoke_signed` using its own
+    /// seeds (`[b"stake_pool", slab, bump]`) as the marketauth — see
+    /// `cpi::cpi_resolve_market` for the byte-for-byte wire proof against the
+    /// deployed wrapper.
+    ///
+    /// H-1 GATE (security review, RE-REVIEW FIX): rejects with
+    /// `StakeError::InsuranceLossOutstanding` unless `pool.total_flushed <=
+    /// pool.total_recovered_from_wrapper` (every flushed token has actually been
+    /// recovered FROM THE WRAPPER). `RecoverFlushedInsurance` (tag 23) CPIs
+    /// wrapper tag 57 `WithdrawInsuranceAsset`, which itself requires LIVE mode
+    /// (mode == 0); once THIS instruction's CPI flips the wrapper to mode != 0,
+    /// tag 57 permanently rejects with EngineLockActive and any outstanding
+    /// flush would be stranded with no recovery path (this program does NOT
+    /// implement the wrapper's terminal-mode `WithdrawInsurance`, tag 41, as a
+    /// fallback CPI). Gating resolution on full recovery-first is the CHOSEN fix
+    /// over adding a second CPI wire: it is strictly less new attack surface (no
+    /// new wrapper wire to byte-match, no new account shape to validate) and
+    /// makes the stranding scenario structurally unreachable rather than merely
+    /// recoverable.
+    ///
+    /// The gate is deliberately measured against `total_recovered_from_wrapper`,
+    /// a counter incremented ONLY inside `process_recover_flushed_insurance`
+    /// after its wrapper CPI succeeds — NOT `total_returned`, which is also
+    /// incremented by `ReturnInsurance` (tag 10 — admin's own wallet tokens
+    /// transferred into pool.vault, zero wrapper CPI) and the #161
+    /// last-junior-exit phantom write-off (zero token movement). A
+    /// `total_returned`-based gate let an admin satisfy H-1 via `ReturnInsurance`
+    /// alone while flushed capital stayed stranded in the wrapper — this is the
+    /// bug the re-review found and this counter fixes. The admin must call
+    /// `RecoverFlushedInsurance` until `total_flushed <=
+    /// total_recovered_from_wrapper` before this instruction will succeed.
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Admin (must equal pool.admin)
+    ///   1. `[]` Pool PDA (the marketauth; signs the CPI via invoke_signed)
+    ///   2. `[writable]` Slab / market account (wrapper-owned)
+    ///   3. `[]` Percolator program
+    AdminResolveMarket,
+
+    /// 25: AdminUpdateFeeSplit — CPI proxy for the wrapper's UpdateFeeSplit
+    /// (tag 86). GROUP A: gated on `cfg.marketauth`, so the POOL PDA signs.
+    ///
+    /// `InitPool` rotates `cfg.marketauth` to the pool PDA, so after staking no
+    /// key can call wrapper tag 86 directly and the market's fee split is
+    /// frozen at whatever it was at stake time. This proxy restores it.
+    ///
+    /// VALIDATION LIVES IN THE WRAPPER. `policy_v16::validate_fee_split`
+    /// enforces sum-to-total and the creator/LP/insurance floors inside
+    /// `handle_update_fee_split`. This program deliberately does NOT re-check
+    /// those bounds: a second copy would drift from the first the moment either
+    /// side is retuned. Bad shares fail at the wrapper with its own error.
+    ///
+    /// AUTHORITY: `pool.admin`, mirroring `AdminResolveMarket`.
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Admin (must equal pool.admin)
+    ///   1. `[]` Pool PDA (the marketauth; signs the CPI via invoke_signed)
+    ///   2. `[writable]` Slab / market account (wrapper-owned)
+    ///   3. `[]` Percolator program
+    AdminUpdateFeeSplit {
+        creator_share_bps: u16,
+        lp_share_bps: u16,
+        insurance_share_bps: u16,
+    },
+
+    /// 26: AdminUpdateMaintenanceFeePerSlot — CPI proxy for the wrapper's
+    /// UpdateMaintenanceFeePerSlot (tag 88). GROUP A: marketauth-gated, so the
+    /// POOL PDA signs.
+    ///
+    /// PAYLOAD IS `u128`, NOT `u64`. The wrapper decodes this argument with
+    /// `read_u128` (v16_program.rs tag-88 arm) and stores it in
+    /// `WrapperConfigV16::maintenance_fee_per_slot`, which is a `u128`. Sending
+    /// 8 bytes would leave `rest` non-empty on the wrapper side and be rejected
+    /// with `InvalidInstructionData`, and would also make all but the bottom
+    /// ~1.8e19 of the valid `MAX_PROTOCOL_FEE_ABS` (1e36) range unreachable.
+    ///
+    /// The wrapper enforces `maintenance_fee_per_slot <= MAX_PROTOCOL_FEE_ABS`;
+    /// this program does not duplicate that bound.
+    ///
+    /// AUTHORITY: `pool.admin`, mirroring `AdminResolveMarket`.
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Admin (must equal pool.admin)
+    ///   1. `[]` Pool PDA (the marketauth; signs the CPI via invoke_signed)
+    ///   2. `[writable]` Slab / market account (wrapper-owned)
+    ///   3. `[]` Percolator program
+    AdminUpdateMaintenanceFeePerSlot { maintenance_fee_per_slot: u128 },
+
+    /// 27: AdminUpdateBackingFeePolicy — CPI proxy for the wrapper's
+    /// UpdateBackingFeePolicy (tag 51). GROUP B: gated on the per-asset
+    /// `insurance_authority`, so the VAULT_AUTH PDA signs — NOT the pool PDA.
+    ///
+    /// THIS IS THE TAG THAT SETS `backing_trade_fee_bps`. `BindInsuranceAuthority`
+    /// (tag 19) hands asset 0's `insurance_authority` to `vault_auth`; from that
+    /// moment nobody can set the backing fee on this market without this proxy,
+    /// which is precisely why the protocol fee split was unachievable on a
+    /// staked market.
+    ///
+    /// ORDERING: before the bind, `insurance_authority` is still the creator's
+    /// key and tag 51 is reachable directly; this proxy would then fail at the
+    /// wrapper's `expect_live_authority` because `vault_auth` is not yet the
+    /// authority. So the bind is a precondition, and this proxy restores a
+    /// capability rather than transferring one.
+    ///
+    /// `domain` selects the backing bucket; the wrapper maps `asset_index =
+    /// domain / 2` and gates on THAT asset's `insurance_authority`. This program
+    /// does not restrict `domain`: `BindInsuranceAuthority` binds asset 0 only,
+    /// so any domain >= 2 resolves to an asset whose `insurance_authority` is
+    /// not `vault_auth` and the wrapper fails closed on its own. Constraining it
+    /// here would duplicate wrapper logic and break if multi-asset binding is
+    /// added later.
+    ///
+    /// AUTHORITY: `pool.admin`, mirroring `AdminResolveMarket` and
+    /// `BindInsuranceAuthority` (which is likewise `pool.admin`-gated).
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Admin (must equal pool.admin)
+    ///   1. `[]` Pool PDA (used to derive + verify vault_auth; not a signer)
+    ///   2. `[]` Vault authority PDA (the insurance_authority; signs via invoke_signed)
+    ///   3. `[writable]` Slab / market account (wrapper-owned)
+    ///   4. `[]` Percolator program
+    AdminUpdateBackingFeePolicy {
+        domain: u16,
+        fee_bps: u16,
+        insurance_share_bps: u16,
+    },
+
+    /// 28: AdminUpdateTradeFeePolicy — CPI proxy for the wrapper's
+    /// UpdateTradeFeePolicy (tag 55). GROUP B: gated on ASSET 0's
+    /// `insurance_authority` (the wrapper hardcodes asset 0 here), so the
+    /// VAULT_AUTH PDA signs — NOT the pool PDA.
+    ///
+    /// Same bind-ordering property as tag 27: reachable directly before
+    /// `BindInsuranceAuthority`, only through this proxy afterward.
+    ///
+    /// The wrapper enforces `trade_fee_base_bps <= max_trading_fee_bps` and
+    /// `<= MAX_DYNAMIC_TRADE_FEE_BPS`; this program does not duplicate those.
+    ///
+    /// AUTHORITY: `pool.admin`, mirroring `AdminResolveMarket`.
+    ///
+    /// Accounts:
+    ///   0. `[signer]` Admin (must equal pool.admin)
+    ///   1. `[]` Pool PDA (used to derive + verify vault_auth; not a signer)
+    ///   2. `[]` Vault authority PDA (the insurance_authority; signs via invoke_signed)
+    ///   3. `[writable]` Slab / market account (wrapper-owned)
+    ///   4. `[]` Percolator program
+    AdminUpdateTradeFeePolicy { trade_fee_base_bps: u64 },
+}
+
+impl StakeInstruction {
+    pub fn unpack(data: &[u8]) -> Result<Self, ProgramError> {
+        let (&tag, rest) = data
+            .split_first()
+            .ok_or(ProgramError::InvalidInstructionData)?;
+
+        match tag {
+            0 => {
+                if rest.len() != 16 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let cooldown_slots = u64::from_le_bytes(
+                    rest[0..8]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                let deposit_cap = u64::from_le_bytes(
+                    rest[8..16]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                Ok(Self::InitPool {
+                    cooldown_slots,
+                    deposit_cap,
+                })
+            }
+            1 => {
+                if rest.len() != 8 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let amount = u64::from_le_bytes(
+                    rest[0..8]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                Ok(Self::Deposit { amount })
+            }
+            2 => {
+                if rest.len() != 8 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let lp_amount = u64::from_le_bytes(
+                    rest[0..8]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                Ok(Self::Withdraw { lp_amount })
+            }
+            3 => {
+                if rest.len() != 8 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let amount = u64::from_le_bytes(
+                    rest[0..8]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                Ok(Self::FlushToInsurance { amount })
+            }
+            4 => {
+                if rest.len() != 18 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let has_cooldown = rest[0] != 0;
+                let cooldown = u64::from_le_bytes(
+                    rest[1..9]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                let has_cap = rest[9] != 0;
+                let cap = u64::from_le_bytes(
+                    rest[10..18]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                Ok(Self::UpdateConfig {
+                    new_cooldown_slots: if has_cooldown { Some(cooldown) } else { None },
+                    new_deposit_cap: if has_cap { Some(cap) } else { None },
+                })
+            }
+            5 => {
+                if rest.len() != 32 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let new_admin: [u8; 32] = rest[0..32]
+                    .try_into()
+                    .map_err(|_| ProgramError::InvalidInstructionData)?;
+                Ok(Self::ProposeAdmin { new_admin })
+            }
+            6 => {
+                if !rest.is_empty() {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                Ok(Self::AcceptAdmin)
+            }
+            7 => {
+                // #242: ProposeCooldownIncrease { new_cooldown_slots: u64 }
+                if rest.len() != 8 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let new_cooldown_slots = u64::from_le_bytes(
+                    rest[0..8]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                Ok(Self::ProposeCooldownIncrease { new_cooldown_slots })
+            }
+            8 => {
+                // #242: CommitCooldownIncrease
+                if !rest.is_empty() {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                Ok(Self::CommitCooldownIncrease)
+            }
+            9 => {
+                // #242: CancelCooldownIncrease
+                if !rest.is_empty() {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                Ok(Self::CancelCooldownIncrease)
+            }
+            // Tag 11 tombstoned — was an admin CPI proxy, now removed.
+            19 => {
+                if !rest.is_empty() {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                Ok(Self::BindInsuranceAuthority)
+            }
+            20 => {
+                if !rest.is_empty() {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                Ok(Self::RotateInsuranceAuthority)
+            }
+            21 => {
+                if !rest.is_empty() {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                Ok(Self::BurnAssetAdmin)
+            }
+            22 => {
+                if !rest.is_empty() {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                Ok(Self::RotateInsuranceOperator)
+            }
+            23 => {
+                if rest.len() != 8 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let amount = u64::from_le_bytes(
+                    rest[0..8]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                Ok(Self::RecoverFlushedInsurance { amount })
+            }
+            10 => {
+                if rest.len() != 8 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let amount = u64::from_le_bytes(
+                    rest[0..8]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                Ok(Self::ReturnInsurance { amount })
+            }
+            12 => {
+                if !rest.is_empty() {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                Ok(Self::AccrueFees)
+            }
+            13 => {
+                if rest.len() != 16 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let cooldown_slots = u64::from_le_bytes(
+                    rest[0..8]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                let deposit_cap = u64::from_le_bytes(
+                    rest[8..16]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                Ok(Self::InitTradingPool {
+                    cooldown_slots,
+                    deposit_cap,
+                })
+            }
+            14 => {
+                if rest.len() != 3 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let enabled = rest[0] != 0;
+                let hwm_floor_bps = u16::from_le_bytes(
+                    rest[1..3]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                Ok(Self::AdminSetHwmConfig {
+                    enabled,
+                    hwm_floor_bps,
+                })
+            }
+            15 => {
+                if rest.len() != 2 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let junior_fee_mult_bps = u16::from_le_bytes(
+                    rest[0..2]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                Ok(Self::AdminSetTrancheConfig {
+                    junior_fee_mult_bps,
+                })
+            }
+            16 => {
+                if rest.len() != 8 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let amount = u64::from_le_bytes(
+                    rest[0..8]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                Ok(Self::DepositJunior { amount })
+            }
+            18 => {
+                if !rest.is_empty() {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                Ok(Self::SetMarketResolved)
+            }
+            24 => {
+                if !rest.is_empty() {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                Ok(Self::AdminResolveMarket)
+            }
+            // 25: AdminUpdateFeeSplit — three u16 shares = 6 bytes.
+            25 => {
+                if rest.len() != 6 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let creator_share_bps = u16::from_le_bytes(
+                    rest[0..2]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                let lp_share_bps = u16::from_le_bytes(
+                    rest[2..4]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                let insurance_share_bps = u16::from_le_bytes(
+                    rest[4..6]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                Ok(Self::AdminUpdateFeeSplit {
+                    creator_share_bps,
+                    lp_share_bps,
+                    insurance_share_bps,
+                })
+            }
+            // 26: AdminUpdateMaintenanceFeePerSlot — u128 = 16 bytes, NOT 8.
+            // The wrapper decodes tag 88 with `read_u128`; a u64 payload would
+            // leave trailing bytes unconsumed and be rejected there.
+            26 => {
+                if rest.len() != 16 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let maintenance_fee_per_slot = u128::from_le_bytes(
+                    rest[0..16]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                Ok(Self::AdminUpdateMaintenanceFeePerSlot {
+                    maintenance_fee_per_slot,
+                })
+            }
+            // 27: AdminUpdateBackingFeePolicy — three u16 = 6 bytes.
+            27 => {
+                if rest.len() != 6 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let domain = u16::from_le_bytes(
+                    rest[0..2]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                let fee_bps = u16::from_le_bytes(
+                    rest[2..4]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                let insurance_share_bps = u16::from_le_bytes(
+                    rest[4..6]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                Ok(Self::AdminUpdateBackingFeePolicy {
+                    domain,
+                    fee_bps,
+                    insurance_share_bps,
+                })
+            }
+            // 28: AdminUpdateTradeFeePolicy — u64 = 8 bytes (wrapper tag 55
+            // decodes with `read_u64`, unlike tag 88's `read_u128`).
+            28 => {
+                if rest.len() != 8 {
+                    return Err(ProgramError::InvalidInstructionData);
+                }
+                let trade_fee_base_bps = u64::from_le_bytes(
+                    rest[0..8]
+                        .try_into()
+                        .map_err(|_| ProgramError::InvalidInstructionData)?,
+                );
+                Ok(Self::AdminUpdateTradeFeePolicy { trade_fee_base_bps })
+            }
+            _ => Err(ProgramError::InvalidInstructionData),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_unpack_init_pool() {
+        let mut data = vec![0u8];
+        data.extend_from_slice(&100u64.to_le_bytes());
+        data.extend_from_slice(&5000u64.to_le_bytes());
+        match StakeInstruction::unpack(&data).unwrap() {
+            StakeInstruction::InitPool {
+                cooldown_slots,
+                deposit_cap,
+            } => {
+                assert_eq!(cooldown_slots, 100);
+                assert_eq!(deposit_cap, 5000);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_unpack_deposit() {
+        let mut data = vec![1u8];
+        data.extend_from_slice(&42u64.to_le_bytes());
+        match StakeInstruction::unpack(&data).unwrap() {
+            StakeInstruction::Deposit { amount } => assert_eq!(amount, 42),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_unpack_withdraw() {
+        let mut data = vec![2u8];
+        data.extend_from_slice(&999u64.to_le_bytes());
+        match StakeInstruction::unpack(&data).unwrap() {
+            StakeInstruction::Withdraw { lp_amount } => assert_eq!(lp_amount, 999),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_unpack_return_insurance() {
+        let mut data = vec![10u8];
+        data.extend_from_slice(&1234u64.to_le_bytes());
+        match StakeInstruction::unpack(&data).unwrap() {
+            StakeInstruction::ReturnInsurance { amount } => assert_eq!(amount, 1234),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_unpack_set_market_resolved() {
+        let data = vec![18u8];
+        match StakeInstruction::unpack(&data).unwrap() {
+            StakeInstruction::SetMarketResolved => {}
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_tombstoned_tags_rejected() {
+        // Tags 11, 17 remain tombstoned (5/6 reclaimed for admin rotation; 7/8/9
+        // reclaimed for the #242 cooldown-increase timelock).
+        for tag in [11u8, 17] {
+            let data = vec![tag];
+            assert!(
+                StakeInstruction::unpack(&data).is_err(),
+                "tag {} should be rejected",
+                tag
+            );
+        }
+    }
+
+    #[test]
+    fn test_unpack_propose_cooldown_increase() {
+        let mut data = vec![7u8];
+        data.extend_from_slice(&123_456u64.to_le_bytes());
+        match StakeInstruction::unpack(&data).unwrap() {
+            StakeInstruction::ProposeCooldownIncrease { new_cooldown_slots } => {
+                assert_eq!(new_cooldown_slots, 123_456)
+            }
+            _ => panic!("wrong variant"),
+        }
+        // wrong length is rejected
+        assert!(StakeInstruction::unpack(&[7u8]).is_err());
+        assert!(StakeInstruction::unpack(&[7u8, 1, 2, 3]).is_err());
+    }
+
+    #[test]
+    fn test_unpack_commit_and_cancel_cooldown_increase() {
+        match StakeInstruction::unpack(&[8u8]).unwrap() {
+            StakeInstruction::CommitCooldownIncrease => {}
+            _ => panic!("wrong variant"),
+        }
+        match StakeInstruction::unpack(&[9u8]).unwrap() {
+            StakeInstruction::CancelCooldownIncrease => {}
+            _ => panic!("wrong variant"),
+        }
+        // trailing bytes rejected
+        assert!(StakeInstruction::unpack(&[8u8, 0]).is_err());
+        assert!(StakeInstruction::unpack(&[9u8, 0]).is_err());
+    }
+
+    #[test]
+    fn test_unpack_propose_admin() {
+        let new_admin = [7u8; 32];
+        let mut data = vec![5u8];
+        data.extend_from_slice(&new_admin);
+        match StakeInstruction::unpack(&data).unwrap() {
+            StakeInstruction::ProposeAdmin { new_admin: got } => assert_eq!(got, new_admin),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_unpack_propose_admin_truncated_rejected() {
+        // tag 5 with < 32 payload bytes must error gracefully, not panic.
+        let mut data = vec![5u8];
+        data.extend_from_slice(&[0u8; 31]); // one byte short
+        assert!(StakeInstruction::unpack(&data).is_err());
+        // tag-only (no payload) also rejects.
+        assert!(StakeInstruction::unpack(&[5u8]).is_err());
+    }
+
+    #[test]
+    fn test_unpack_accept_admin() {
+        match StakeInstruction::unpack(&[6u8]).unwrap() {
+            StakeInstruction::AcceptAdmin => {}
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_unpack_bind_insurance_authority() {
+        match StakeInstruction::unpack(&[19u8]).unwrap() {
+            StakeInstruction::BindInsuranceAuthority => {}
+            _ => panic!("wrong variant"),
+        }
+        // trailing bytes are now rejected (no payload expected).
+        assert!(StakeInstruction::unpack(&[19u8, 0, 0]).is_err());
+    }
+
+    #[test]
+    fn test_unpack_rotate_insurance_authority() {
+        match StakeInstruction::unpack(&[20u8]).unwrap() {
+            StakeInstruction::RotateInsuranceAuthority => {}
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_propose_admin_zero_pubkey_cancel_sentinel_unpacks() {
+        // Proposing the zero pubkey is the documented "cancel" sentinel; unpack
+        // must accept it (the processor interprets zero as cancel).
+        let mut data = vec![5u8];
+        data.extend_from_slice(&[0u8; 32]);
+        match StakeInstruction::unpack(&data).unwrap() {
+            StakeInstruction::ProposeAdmin { new_admin } => assert_eq!(new_admin, [0u8; 32]),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    /// S-5: every byte-reading tag must reject a truncated payload gracefully
+    /// (Err, never panic). Feeds one byte short of each tag's required length.
+    #[test]
+    fn test_truncated_payloads_never_panic() {
+        // (tag, required_payload_len)
+        let cases: &[(u8, usize)] = &[
+            (0, 16),
+            (1, 8),
+            (2, 8),
+            (3, 8),
+            (4, 18),
+            (5, 32),
+            (10, 8),
+            (13, 16),
+            (14, 3),
+            (15, 2),
+            (16, 8),
+            (23, 8),
+        ];
+        for &(tag, need) in cases {
+            for short_len in 0..need {
+                let mut data = vec![tag];
+                data.extend_from_slice(&vec![0u8; short_len]);
+                let res = StakeInstruction::unpack(&data);
+                assert!(
+                    res.is_err(),
+                    "tag {} with {} payload bytes (need {}) must Err, not panic",
+                    tag,
+                    short_len,
+                    need
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_unpack_invalid_tag() {
+        assert!(StakeInstruction::unpack(&[255u8]).is_err());
+    }
+
+    #[test]
+    fn test_unpack_empty() {
+        assert!(StakeInstruction::unpack(&[]).is_err());
+    }
+
+    /// #209 PoC: fixed-size payloads must reject trailing bytes instead of
+    /// silently ignoring them.
+    #[test]
+    fn poc_byte_payload_instructions_should_reject_trailing_bytes() {
+        let cases: &[(u8, Vec<u8>, &str)] = &[
+            (
+                0,
+                {
+                    let mut payload = Vec::new();
+                    payload.extend_from_slice(&100u64.to_le_bytes());
+                    payload.extend_from_slice(&5_000u64.to_le_bytes());
+                    payload.push(99);
+                    payload
+                },
+                "InitPool",
+            ),
+            (
+                1,
+                {
+                    let mut payload = Vec::new();
+                    payload.extend_from_slice(&42u64.to_le_bytes());
+                    payload.push(99);
+                    payload
+                },
+                "Deposit",
+            ),
+            (
+                2,
+                {
+                    let mut payload = Vec::new();
+                    payload.extend_from_slice(&42u64.to_le_bytes());
+                    payload.push(99);
+                    payload
+                },
+                "Withdraw",
+            ),
+            (
+                3,
+                {
+                    let mut payload = Vec::new();
+                    payload.extend_from_slice(&42u64.to_le_bytes());
+                    payload.push(99);
+                    payload
+                },
+                "FlushToInsurance",
+            ),
+            (
+                10,
+                {
+                    let mut payload = Vec::new();
+                    payload.extend_from_slice(&42u64.to_le_bytes());
+                    payload.push(99);
+                    payload
+                },
+                "ReturnInsurance",
+            ),
+            (
+                13,
+                {
+                    let mut payload = Vec::new();
+                    payload.extend_from_slice(&100u64.to_le_bytes());
+                    payload.extend_from_slice(&5_000u64.to_le_bytes());
+                    payload.push(99);
+                    payload
+                },
+                "InitTradingPool",
+            ),
+            (
+                15,
+                {
+                    let mut payload = Vec::new();
+                    payload.extend_from_slice(&1_500u16.to_le_bytes());
+                    payload.push(99);
+                    payload
+                },
+                "AdminSetTrancheConfig",
+            ),
+            (
+                16,
+                {
+                    let mut payload = Vec::new();
+                    payload.extend_from_slice(&42u64.to_le_bytes());
+                    payload.push(99);
+                    payload
+                },
+                "DepositJunior",
+            ),
+            (
+                23,
+                {
+                    let mut payload = Vec::new();
+                    payload.extend_from_slice(&42u64.to_le_bytes());
+                    payload.push(99);
+                    payload
+                },
+                "RecoverFlushedInsurance",
+            ),
+        ];
+
+        for (tag, payload, name) in cases {
+            let mut data = vec![*tag];
+            data.extend_from_slice(payload);
+
+            let result = StakeInstruction::unpack(&data);
+
+            assert!(
+                matches!(result, Err(ProgramError::InvalidInstructionData)),
+                "{} should reject trailing bytes",
+                name
+            );
+        }
+    }
+
+    /// #209 PoC: tag-only instructions must reject any trailing bytes too.
+    #[test]
+    fn poc_tag_only_instructions_should_reject_trailing_bytes() {
+        for tag in [6u8, 12, 18, 19, 20, 21, 22, 24] {
+            let result = StakeInstruction::unpack(&[tag, 99]);
+            assert!(
+                matches!(result, Err(ProgramError::InvalidInstructionData)),
+                "tag {} should reject trailing bytes",
+                tag
+            );
+        }
+    }
+
+    /// Tag 23 RecoverFlushedInsurance: round-trip pack/unpack.
+    #[test]
+    fn test_unpack_recover_flushed_insurance_round_trip() {
+        let amount: u64 = 123_456_789;
+        let mut data = vec![23u8];
+        data.extend_from_slice(&amount.to_le_bytes());
+        assert_eq!(
+            data.len(),
+            9,
+            "tag 23 payload must be 1 tag + 8 amount bytes"
+        );
+        match StakeInstruction::unpack(&data).unwrap() {
+            StakeInstruction::RecoverFlushedInsurance { amount: got } => {
+                assert_eq!(got, amount, "amount round-trips correctly")
+            }
+            _ => panic!("wrong variant"),
+        }
+        // u64::MAX round-trips
+        let mut data_max = vec![23u8];
+        data_max.extend_from_slice(&u64::MAX.to_le_bytes());
+        match StakeInstruction::unpack(&data_max).unwrap() {
+            StakeInstruction::RecoverFlushedInsurance { amount: got } => {
+                assert_eq!(got, u64::MAX)
+            }
+            _ => panic!("wrong variant for u64::MAX"),
+        }
+    }
+
+    /// Tag 23 must reject a short payload (any length < 8 bytes after the tag).
+    #[test]
+    fn test_unpack_recover_flushed_insurance_short_payload_rejected() {
+        for short_len in 0u8..8 {
+            let mut data = vec![23u8];
+            data.extend(std::iter::repeat(0u8).take(short_len as usize));
+            assert!(
+                StakeInstruction::unpack(&data).is_err(),
+                "tag 23 with {} payload bytes must Err",
+                short_len
+            );
+        }
+    }
+
+    /// Tag 23 must reject trailing bytes beyond the required 8-byte payload.
+    #[test]
+    fn test_unpack_recover_flushed_insurance_trailing_bytes_rejected() {
+        let mut data = vec![23u8];
+        data.extend_from_slice(&1u64.to_le_bytes());
+        data.push(99u8); // trailing byte
+        assert!(
+            matches!(
+                StakeInstruction::unpack(&data),
+                Err(ProgramError::InvalidInstructionData)
+            ),
+            "tag 23 with trailing bytes must reject"
+        );
+    }
+
+    /// C-1: tag 24 AdminResolveMarket round-trips with no payload.
+    #[test]
+    fn test_unpack_admin_resolve_market() {
+        match StakeInstruction::unpack(&[24u8]).unwrap() {
+            StakeInstruction::AdminResolveMarket => {}
+            _ => panic!("wrong variant"),
+        }
+        // trailing bytes rejected (no payload expected).
+        assert!(StakeInstruction::unpack(&[24u8, 0, 0]).is_err());
+    }
+
+    /// C-1: tag 24 must reject trailing bytes (tag-only instruction).
+    #[test]
+    fn test_unpack_admin_resolve_market_trailing_bytes_rejected() {
+        let result = StakeInstruction::unpack(&[24u8, 99]);
+        assert!(
+            matches!(result, Err(ProgramError::InvalidInstructionData)),
+            "tag 24 should reject trailing bytes"
+        );
+    }
+}

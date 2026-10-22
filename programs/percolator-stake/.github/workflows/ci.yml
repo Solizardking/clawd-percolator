@@ -1,0 +1,386 @@
+name: CI
+
+# NOTE: these were `master`, a branch that does not exist in this repository, so
+# CI had NEVER run on any push or pull request. Three defects reached the deployed
+# devnet program under that blind spot.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          path: percolator-stake
+
+      # The e2e suites run the REAL programs under LiteSVM, loading
+      # `percolator-stake/target/deploy/percolator_stake.so` and the sibling
+      # `percolator-prog/target/deploy/percolator_prog.so`. Both are gitignored
+      # build artifacts, so they must be built here or those suites do not
+      # exercise the on-chain code at all.
+      # #286: this used to be `ref: main` for BOTH siblings, and that is what made
+      # this trunk go red on 2026-09-02 without anyone changing percolator-stake.
+      # The wrapper is, from this repo's point of view, a SEPARATE DEPLOYED PROGRAM
+      # that keeps running its deployed build after we merge to its main — so these
+      # suites must test the bytes that are actually on chain, exactly as
+      # percolator-prog's own ci.yml pins ITS siblings and for the same stated
+      # reason. Tracking main meant an unreleased wrapper change landed here
+      # instantly, as a silent red trunk rather than a deliberate decision.
+      #
+      # Pinned to WRAPPER_DEPLOYED from percolator-prog/ci/deployed-refs.env, which
+      # is the canonical record of what is on chain. The guard step below re-reads
+      # that file from prog's CURRENT main and fails if this pin has fallen behind,
+      # so a deploy cannot quietly leave these suites testing stale bytes.
+      #
+      # Verified byte-for-byte: percolator-prog@19d5d932 built with
+      # `cargo build-sbf -- --features devnet` reproduces
+      # DhSkE7uTb8HBUYYWF1xkxMYBGtLYJEoDq1tfBD7SnHcj exactly (sha256
+      # f9056571a2dedfca2ac40235d6d7e85d30bcf10d24c161074d268be1d6cdc802 over the
+      # 1243192 content bytes; on-chain is that plus 7040 bytes of zero padding).
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: dcccrypto/percolator-prog
+          path: percolator-prog
+          ref: 15eb8b0c599e35a1c224bfa74f92b810c78fefb7
+          token: ${{ secrets.PERCOLATOR_PROG_TOKEN || github.token }}
+
+      # A second checkout of prog's CURRENT main, used to read
+      # ci/deployed-refs.env for the drift guard below and to resolve whether
+      # WRAPPER_DEPLOYED contains wrapper #455. Full history is required for the
+      # ancestry check; this checkout is still not built or tested.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: dcccrypto/percolator-prog
+          path: percolator-prog-refs
+          ref: main
+          fetch-depth: 0
+          token: ${{ secrets.PERCOLATOR_PROG_TOKEN || github.token }}
+
+      # percolator-prog has a path dependency on the engine
+      # (`percolator = { path = "../percolator" }`), so the wrapper cannot build
+      # without it checked out as a sibling.
+      # #286: also pinned, and for a subtler reason than the wrapper. The engine is
+      # a PATH DEPENDENCY compiled INTO the wrapper, so "wrapper 15eb8b0c" is only
+      # a complete description of the deployed bytes together with the engine
+      # commit it was built against. Leaving this on main while pinning the wrapper
+      # would still let engine merges change what these suites run.
+      #
+      # That is not hypothetical: the #286 bisect showed engine-main alone passed
+      # and wrapper-main alone passed, but the two TOGETHER failed. An unpinned
+      # engine reintroduces exactly that interaction.
+      #
+      # f53be74a is the deployed lineage and is an ancestor of main
+      # (dcccrypto/percolator@b5ddba2e merged it back), so this is a subset of main
+      # rather than a fork, and the wrapper built from it reproduces the deployed
+      # DhSkE7u.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: dcccrypto/percolator
+          path: percolator
+          # FULL 40-char SHA: actions/checkout resolves `ref` with `git fetch origin
+          # <ref>`, and an abbreviated SHA is not a valid fetch refspec. percolator-prog's
+          # ci.yml records that this exact mistake kept its CI from ever going green.
+          ref: f53be74aafcf5beda06890ffe3c4392637fe54bb
+          token: ${{ secrets.PERCOLATOR_PROG_TOKEN || github.token }}
+
+      - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1
+        with:
+          toolchain: stable
+          # This action defaults to rustflags: "-D warnings" and exports it as a
+          # GLOBAL env var, so it applies to every crate compiled here —
+          # including the sibling path dependencies. That made the engine fail to
+          # build on an `unused_mut` it has never been required to satisfy
+          # (percolator/src/v16.rs:9207), breaking the wrapper .so and this whole
+          # job. Deny-warnings for THIS crate is enforced by the Clippy job, which
+          # passes -D warnings explicitly; imposing it on other repos' code is not
+          # this workflow's business.
+          rustflags: ""
+
+      # NOTE on reproducibility: cargo-build-sbf bundles its own platform-tools
+      # rustc, so the CLI version determines the emitted bytes. "stable" here
+      # produces a 1206296-byte wrapper, while the DEPLOYED one is 1243192 (built
+      # with CLI 3.1.15 / platform-tools v1.52). Pinning would close that gap, but
+      # release.anza.xyz has no v3.1.15 installer (404; v3.1.14 is the nearest
+      # published one), so this stays on stable. What matters for these suites is
+      # already correct: same source ref (percolator-prog main) and same feature
+      # set (--features devnet). The sha is logged below so drift is visible.
+      - name: Install Solana CLI (provides cargo-build-sbf)
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+
+      # #286 DRIFT GUARD. Pinning is only safe if the pin is noticed when it goes
+      # stale. percolator-prog/ci/deployed-refs.env is the canonical record of what
+      # is on chain, so compare our pin against prog's CURRENT main copy of it.
+      #
+      #   pin == WRAPPER_DEPLOYED  -> these suites are testing the deployed bytes.
+      #   pin != WRAPPER_DEPLOYED  -> a deploy happened and this pin was not moved.
+      #                               FAIL, loudly, with the value to move it to.
+      #
+      # This is the half that was missing before. The old `ref: main` never went
+      # stale, it just silently tested something else; a bare pin would never go
+      # red, it would just silently test something old. Neither is a signal.
+      - name: Assert the wrapper pin still matches WRAPPER_DEPLOYED
+        run: |
+          refs=percolator-prog-refs/ci/deployed-refs.env
+          if [ ! -f "$refs" ]; then
+            echo "::error::$refs missing — cannot verify the wrapper pin is current"
+            exit 1
+          fi
+          want=$(grep -E '^WRAPPER_DEPLOYED=' "$refs" | cut -d= -f2)
+          have=$(git -C percolator-prog rev-parse HEAD)
+          echo "pinned wrapper : $have"
+          echo "WRAPPER_DEPLOYED: $want"
+          if [ -z "$want" ]; then
+            echo "::error::WRAPPER_DEPLOYED not found in $refs"
+            exit 1
+          fi
+          if [ "$have" != "$want" ]; then
+            echo "::error::wrapper pin is STALE. percolator-prog/ci/deployed-refs.env"
+            echo "::error::now says WRAPPER_DEPLOYED=$want but this workflow pins $have."
+            echo "::error::A wrapper deploy has happened. Update the ref: in this file to"
+            echo "::error::$want and re-run, reviewing any newly failing proxy tests as a"
+            echo "::error::REAL wrapper/stake incompatibility (see issue #286)."
+            exit 1
+          fi
+          echo "wrapper pin is current"
+
+      # #286/#288 DEPLOYMENT-TRANSITION GUARD.
+      #
+      # #288 intentionally keeps the tag-55 proxy regression ignored while the
+      # deployed wrapper predates #455: the current stake signer (pool PDA / marketauth)
+      # is correct for post-#455 wrappers and intentionally incompatible with the
+      # currently deployed pre-#455 wrapper, which expects vault_auth.
+      #
+      # The source already documents the removal condition: when WRAPPER_DEPLOYED
+      # advances to a commit containing #455, delete #[ignore] in the same pin-bump
+      # commit. Make that condition mechanical so a reviewer cannot update the pin
+      # and accidentally leave this regression permanently skipped.
+      - name: Assert tag-55 regression state matches deployed wrapper
+        run: |
+          refs=percolator-prog-refs/ci/deployed-refs.env
+          test_file=percolator-stake/tests/task13_cpi_proxies_e2e.rs
+          boundary=0cc58c7ca1114b951133ec0960b96a565e33bb8e # percolator-prog #455
+          test_name=tag55_trade_fee_direct_dies_after_bind_and_proxy_restores_it
+
+          want=$(sed -n 's/^WRAPPER_DEPLOYED=//p' "$refs")
+          if [[ ! "$want" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::WRAPPER_DEPLOYED must be exactly one full 40-character SHA"
+            exit 1
+          fi
+
+          if ! git -C percolator-prog-refs cat-file -e "${want}^{commit}" 2>/dev/null; then
+            echo "::error::WRAPPER_DEPLOYED=$want is not present in the full prog history"
+            exit 1
+          fi
+          if ! git -C percolator-prog-refs cat-file -e "${boundary}^{commit}" 2>/dev/null; then
+            echo "::error::tag-55 boundary commit $boundary (#455) is not present in prog history"
+            exit 1
+          fi
+
+          # Read the attributes attached to this exact test, including multi-line
+          # attributes. Reset at function/source boundaries so an ignored neighboring
+          # test cannot satisfy the check.
+          detect_tag55_state() {
+            awk '
+              in_attr {
+                if ($0 ~ /\][[:space:]]*$/) {
+                  in_attr = 0
+                }
+                next
+              }
+
+              in_block_comment {
+                if ($0 ~ /\*\//) {
+                  in_block_comment = 0
+                }
+                next
+              }
+
+              /^[[:space:]]*\/\// {
+                next
+              }
+
+              /^[[:space:]]*\/\*/ {
+                if ($0 !~ /\*\//) {
+                  in_block_comment = 1
+                }
+                next
+              }
+
+              /^[[:space:]]*#\[/ {
+                if ($0 ~ /^[[:space:]]*#\[ignore([[:space:]=\]])/) {
+                  ignored = 1
+                }
+
+                if ($0 !~ /\][[:space:]]*$/) {
+                  in_attr = 1
+                }
+
+                next
+              }
+
+              /^[[:space:]]*fn[[:space:]]+tag55_trade_fee_direct_dies_after_bind_and_proxy_restores_it[[:space:]]*\(/ {
+                print ignored ? "ignored" : "active"
+                found = 1
+                exit
+              }
+
+              /^[[:space:]]*(pub[[:space:]]+)?fn[[:space:]]+/ {
+                ignored = 0
+                next
+              }
+
+              /^[[:space:]]*$/ {
+                next
+              }
+
+              {
+                ignored = 0
+              }
+
+              END {
+                if (!found) exit 3
+              }
+            ' "$1"
+            }
+
+            # Regression fixture for the exact false-active case caught in PR #291:
+            # Rust comment trivia between #[ignore] and #[test] must preserve ignored state.
+            comment_fixture=$(mktemp)
+
+            cat >"$comment_fixture" <<'EOF'
+            #[ignore]
+            // Temporary deployment-transition note.
+            #[test]
+            fn tag55_trade_fee_direct_dies_after_bind_and_proxy_restores_it() {}
+          EOF
+
+            if ! fixture_state=$(detect_tag55_state "$comment_fixture"); then
+              rm -f "$comment_fixture"
+              echo "::error::tag-55 ignore-state parser comment fixture could not be evaluated"
+              exit 1
+            fi
+
+            rm -f "$comment_fixture"
+
+            if [ "$fixture_state" != "ignored" ]; then
+              echo "::error::tag-55 parser must preserve #[ignore] across Rust comment trivia"
+              exit 1
+            fi
+
+            state=$(detect_tag55_state "$test_file") || {
+              echo "::error::could not locate $test_name and determine its #[ignore] state"
+              exit 1
+            }
+
+          if git -C percolator-prog-refs merge-base --is-ancestor "$boundary" "$want"; then
+            if [ "$state" != "active" ]; then
+              echo "::error::WRAPPER_DEPLOYED=$want contains #455 ($boundary),"
+              echo "::error::but $test_name is still #[ignore]."
+              echo "::error::Remove the ignore in the same commit that advances the wrapper pin"
+              echo "::error::so the tag-28 -> tag-55 coordinated-deploy regression is exercised."
+              exit 1
+            fi
+            echo "tag-55 guard: deployed wrapper contains #455; regression test is active"
+          else
+            rc=$?
+            if [ "$rc" -ne 1 ]; then
+              echo "::error::git merge-base failed while checking #455 ancestry (status $rc)"
+              exit 1
+            fi
+            echo "tag-55 guard: deployed wrapper predates #455; temporary #[ignore] is permitted"
+          fi
+
+      - name: Build stake BPF program
+        working-directory: percolator-stake
+        run: cargo build-sbf -- --features devnet
+
+      - name: Build wrapper BPF program
+        working-directory: percolator-prog
+        # --features devnet is what the DEPLOYED wrapper was built with: it
+        # compiles the devnet percolator-stake program id into
+        # constants::STAKE_PROGRAM_ID, which tag 87
+        # (WithdrawInsuranceReserveToStake) pins its stake-pool owner check and
+        # PDA derivations to — precisely the path these e2e suites exercise.
+        # Without it the binary is 1237568 bytes instead of the deployed
+        # 1243192, i.e. a different program than the one on devnet.
+        run: cargo build-sbf -- --features devnet
+
+      # Guard: `common_svm_setup()` in the e2e suites returns None and the test
+      # passes VACUOUSLY when either .so is missing — 23 tests across 7 suites
+      # behave that way. Fail loudly here instead, so a green run always means
+      # those suites really executed.
+      - name: Assert both .so artifacts exist
+        run: |
+          stake_so=percolator-stake/target/deploy/percolator_stake.so
+          wrapper_so=percolator-prog/target/deploy/percolator_prog.so
+          missing=0
+          for f in "$stake_so" "$wrapper_so"; do
+            if [ ! -f "$f" ]; then echo "::error::missing $f — e2e suites would silently skip"; missing=1; fi
+          done
+          [ "$missing" -eq 0 ] || exit 1
+          ls -l "$stake_so" "$wrapper_so"
+          # The deployed devnet wrapper DhSkE7uTb8HBUYYWF1xkxMYBGtLYJEoDq1tfBD7SnHcj
+          # is sha256 f9056571a2dedfca2ac40235d6d7e85d30bcf10d24c161074d268be1d6cdc802
+          # over its 1243192 content bytes, from percolator-prog@main built with
+          # --features devnet under CLI 3.1.15. The CI build uses the same source
+          # and features but a newer platform-tools, so expect a DIFFERENT hash
+          # here — see the install step. Logged for visibility, not asserted.
+          echo "wrapper sha256: $(sha256sum "$wrapper_so" | cut -d' ' -f1)"
+          echo "deployed      : f9056571a2dedfca2ac40235d6d7e85d30bcf10d24c161074d268be1d6cdc802"
+
+      - name: Test
+        working-directory: percolator-stake
+        run: cargo test --features no-entrypoint --no-fail-fast
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1
+        with:
+          toolchain: stable
+      - run: cargo build --features no-entrypoint
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1
+        with:
+          toolchain: stable
+          components: clippy
+      # Library only. `--all-targets` currently reports pre-existing lints in the
+      # test suites (large Err variants, argument counts); tightening that is a
+      # separate cleanup, not a gate to add mid-flight.
+      - run: cargo clippy --features no-entrypoint -- -D warnings
+
+  fmt:
+    name: Format
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+      - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c # v1
+        with:
+          toolchain: stable
+          components: rustfmt
+      - run: cargo fmt --all -- --check

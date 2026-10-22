@@ -1,0 +1,1363 @@
+use bytemuck::{Pod, Zeroable};
+use solana_program::pubkey::Pubkey;
+
+/// 8-byte discriminator for StakePool accounts ("SPOOL_V1")
+pub const STAKE_POOL_DISCRIMINATOR: [u8; 8] = [0x53, 0x50, 0x4F, 0x4F, 0x4C, 0x5F, 0x56, 0x31];
+/// 8-byte discriminator for StakeDeposit accounts ("SDEP_V1\0")
+pub const STAKE_DEPOSIT_DISCRIMINATOR: [u8; 8] = [0x53, 0x44, 0x45, 0x50, 0x5F, 0x56, 0x31, 0x00];
+
+/// N7 (CONSOLIDATED-PLAN §2.2): dead-share floor locked at the pool's true genesis
+/// deposit (`total_lp_supply == 0`, whether reached via `Deposit` or
+/// `DepositJunior` — see `processor.rs::apply_minimum_liquidity_lock`, the single
+/// shared choke point both bootstrap paths route through). `MINIMUM_LIQUIDITY`
+/// worth of LP is counted into `pool.total_lp_supply` but NEVER actually
+/// SPL-minted to any account — it is permanently unredeemable "dead" supply, the
+/// classic Uniswap-V2-style anti-inflation floor. This forces the genesis
+/// depositor (who would otherwise hold 100% of a brand-new pool and could donate
+/// raw collateral + crank `AccrueFees` to inflate the tracked share price at
+/// near-zero cost) to permanently sacrifice a fixed amount of real value with
+/// every pool they bootstrap, in addition to the `VIRTUAL_SHARES`/`VIRTUAL_ASSETS`
+/// offset in `math.rs` (defense-in-depth, not a substitute for it — the offset
+/// bounds the COST of each donate-then-accrue round; the dead-share floor bounds
+/// how cheaply a genesis position can be established in the first place).
+/// Value chosen to match collateral tokens with 6-9 decimals (SPL norm, e.g.
+/// USDC=6, SOL=9) without materially raising the practical minimum pool size.
+pub const MINIMUM_LIQUIDITY: u64 = 1_000;
+
+/// Stake pool state — one per slab (market).
+/// PDA seeds: [b"stake_pool", slab_pubkey]
+///
+/// This PDA serves dual purpose:
+/// 1. Holds the pool state (deposits, LP supply, config)
+/// 2. Its pubkey becomes the ADMIN of the wrapper slab (via TransferAdmin)
+///
+/// The wrapper reads header.admin to authorize admin operations.
+/// Since header.admin == this PDA's pubkey, the stake program can
+/// invoke_signed any admin instruction on the wrapper.
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+#[repr(C)]
+pub struct StakePool {
+    /// Whether the pool is initialized (1 = yes, 0 = no)
+    pub is_initialized: u8,
+
+    /// Bump seed for the pool PDA
+    pub bump: u8,
+
+    /// Bump seed for the vault authority PDA
+    pub vault_authority_bump: u8,
+
+    /// Whether wrapper admin has been transferred to this PDA (1 = yes)
+    pub admin_transferred: u8,
+
+    /// Padding for alignment
+    pub _padding: [u8; 4],
+
+    /// The slab (market) this pool manages
+    pub slab: [u8; 32],
+
+    /// Pool creator/admin (can update config, trigger admin CPI)
+    pub admin: [u8; 32],
+
+    /// Collateral mint (must match slab's collateral mint)
+    pub collateral_mint: [u8; 32],
+
+    /// LP token mint (owned by vault_authority PDA)
+    pub lp_mint: [u8; 32],
+
+    /// Vault holding deposited collateral buffer (owned by vault_authority PDA)
+    /// Users deposit here; FlushToInsurance moves funds to wrapper insurance
+    pub vault: [u8; 32],
+
+    /// Total collateral deposited by users (lifetime, in base token units)
+    pub total_deposited: u64,
+
+    /// Total LP tokens in circulation
+    pub total_lp_supply: u64,
+
+    /// Cooldown period in slots before withdrawal is allowed
+    pub cooldown_slots: u64,
+
+    /// Maximum total deposit cap (0 = uncapped)
+    pub deposit_cap: u64,
+
+    /// Total collateral flushed to percolator insurance fund via CPI
+    /// Tracks how much has been moved from stake vault → wrapper insurance
+    pub total_flushed: u64,
+
+    /// Total collateral returned from insurance (via WithdrawInsurance after resolution)
+    pub total_returned: u64,
+
+    /// Total withdrawn by users (lifetime, in base token units)
+    pub total_withdrawn: u64,
+
+    /// Percolator wrapper program ID (for CPI)
+    pub percolator_program: [u8; 32],
+
+    // ========================================
+    // PERC-272: LP Vault Fee Yield & OI Cap
+    // ========================================
+    /// Total trading fees earned by this vault (accrued from percolator engine).
+    /// Increases pool value — LP share price appreciates as fees accrue.
+    pub total_fees_earned: u64,
+
+    /// Last slot when fees were accrued. Currently informational only —
+    /// no rate-limiting enforced (AccrueFees is idempotent via balance delta).
+    /// Reserved for future slot-based rate limiting if needed.
+    pub last_fee_accrual_slot: u64,
+
+    /// #290 fee-attribution cursor (mode-0 pools only). Offset 272, same bytes as
+    /// the field formerly named `last_vault_snapshot`.
+    ///
+    /// The cumulative number of atoms of the wrapper's tag-87 insurance-leg payouts
+    /// (`WrapperConfigV16::insurance_reserve_withdrawn_atoms`) that this pool has
+    /// already booked into `total_fees_earned`. A mode-0 accrual books at most
+    /// `wrapper_counter - mode0_fees_attributed` of vault surplus, so a raw SPL
+    /// donation, which advances no wrapper counter, can never be booked as fees.
+    ///
+    /// Meaningful only once `fee_attribution_armed()` is set (`_reserved[60]`).
+    /// Before #290 these bytes held a write-only vault-balance snapshot (#255: read by
+    /// no accounting path), so an un-armed pool's value is ignored and replaced on
+    /// the first attributed accrual. See `processor::accrue_fees_inner`.
+    pub mode0_fees_attributed: u64,
+
+    /// Pool mode: 0 = insurance LP (legacy), 1 = trading LP vault (PERC-272)
+    /// Trading LP vault earns trading fees and gates OI.
+    pub pool_mode: u8,
+
+    /// Padding for alignment
+    pub _mode_padding: [u8; 7],
+
+    /// Two-step admin rotation (v2): the proposed next admin. Zero = no pending
+    /// proposal. ProposeAdmin (current admin signs) sets it; AcceptAdmin
+    /// (pending_admin signs) consumes it (admin = pending_admin; pending = 0).
+    /// Proposing zero cancels an outstanding proposal.
+    ///
+    /// This is a real struct field (offset 288), NOT carved from `_reserved`:
+    /// only 13 bytes [51..64] were free there, < 32. Adding it grows
+    /// STAKE_POOL_SIZE 352 -> 384 and is why CURRENT_VERSION bumps 1 -> 2.
+    /// Fresh-start cutover: no v1 pools exist, so no migration is needed.
+    pub pending_admin: [u8; 32],
+
+    /// Reserved for future use
+    pub _reserved: [u8; 64],
+
+    /// H-1 re-review fix: cumulative collateral actually recovered from the
+    /// WRAPPER via the tag-57 `WithdrawInsuranceAsset` CPI in
+    /// `process_recover_flushed_insurance` — the ONLY mechanism that pulls
+    /// flushed insurance back out of the wrapper. Incremented exclusively at
+    /// that one CPI success site.
+    ///
+    /// This is deliberately a SEPARATE counter from `total_returned`, which is
+    /// also bumped by two mechanisms that do NOT recover funds from the
+    /// wrapper: `process_return_insurance` (tag 10, the admin's own wallet
+    /// tokens transferred into `pool.vault` — no wrapper CPI) and the #161
+    /// last-junior-exit phantom write-off (`realized_junior_loss`, zero token
+    /// movement). Gating market-resolution on `total_returned` therefore let
+    /// an admin satisfy the H-1 gate via `ReturnInsurance` alone while leaving
+    /// flushed capital permanently stranded in the wrapper post-resolution
+    /// (tag 57 rejects with EngineLockActive once the market is no longer
+    /// mode 0). The resolve-gate in `process_admin_resolve_market` and
+    /// `process_set_market_resolved` must compare `total_flushed` against
+    /// THIS counter, not `total_returned`.
+    ///
+    /// Real struct field (offset 384), NOT carved from `_reserved`: every byte
+    /// of `_reserved`'s 64 bytes is already claimed by PERC-303 tranche state,
+    /// PERC-313 HWM state, and the #242 cooldown-timelock fields, leaving no
+    /// contiguous 8-byte gap for a u64. Adding it grows STAKE_POOL_SIZE
+    /// 384 -> 392 and is why CURRENT_VERSION bumps 2 -> 3. Fresh-start
+    /// cutover: pools are being re-seeded, so no on-chain migration path is
+    /// needed — SDK decoders must add this field for version-3 pools.
+    pub total_recovered_from_wrapper: u64,
+
+    /// #242 timelock (v4): the `cooldown_slots` INCREASE awaiting commit.
+    /// Meaningful only while `cooldown_proposed_at_slot != 0`.
+    ///
+    /// Real struct field (offset 392), NOT carved from `_reserved`. The original
+    /// #242 packing put this at `_reserved[10..18]`, whose comment claimed
+    /// `[10..32]` was "previously-free" — but PERC-313 HWM already owns that
+    /// entire range (`hwm_enabled` at [10], `hwm_floor_bps` at [11..13],
+    /// `epoch_high_water_tvl` at [16..24], `hwm_last_epoch` at [24..32]). The two
+    /// features therefore aliased each other on the DEPLOYED v3 program: proposing
+    /// a cooldown flipped `hwm_enabled` off and rewrote `hwm_floor_bps`, and an HWM
+    /// refresh rewrote the proposal slot — the latter reading as a long-elapsed
+    /// timelock, i.e. a bypass of the very delay that protects stakers from the
+    /// admin. See `tests/poc_cooldown_timelock_hwm_overlap.rs`.
+    pub pending_cooldown_slots: u64,
+
+    /// #242 timelock (v4): the slot at which the pending cooldown increase was
+    /// proposed. `0` = no active proposal (the sentinel; a live slot is never 0).
+    /// Real struct field (offset 400) — see [`StakePool::pending_cooldown_slots`]
+    /// for why these are no longer packed into `_reserved`.
+    pub cooldown_proposed_at_slot: u64,
+}
+
+/// Size of StakePool in bytes
+pub const STAKE_POOL_SIZE: usize = core::mem::size_of::<StakePool>();
+
+// ════════════════════════════════════════════════════════════════════════════
+// CROSS-PROGRAM LAYOUT CONTRACT (O5) — DO NOT WEAKEN
+//
+// The percolator wrapper does NOT link this crate. Its tag-87 handler
+// (`WithdrawInsuranceReserveToStake`) validates a `StakePool` account by
+// reading RAW BYTES at hardcoded offsets, mirrored in
+// `percolator-prog/src/v16_program.rs` as `constants::STAKE_POOL_OFF_*`.
+// Those offsets decide WHERE TAG-87 FUNDS LAND.
+//
+// A total-size assertion alone (`test_stake_pool_size`, 392) is NOT enough:
+// ANY same-size field reorder — swapping `vault` with `collateral_mint`, say —
+// keeps the size at 392, passes every test in BOTH repos, and silently
+// redirects the insurance-reserve payout to an attacker-chosen token account.
+//
+// These const assertions pin every offset the wrapper depends on, so a reorder
+// is a COMPILE ERROR in the program that owns the struct — the only place that
+// can notice. If one of these fires, you must update
+// `percolator-prog/src/v16_program.rs::constants::STAKE_POOL_OFF_*` in the
+// SAME change, and re-deploy both programs together.
+// ════════════════════════════════════════════════════════════════════════════
+const _: () = {
+    use core::mem::offset_of;
+    // STAKE_POOL_OFF_IS_INITIALIZED — pool must be live (byte == 1).
+    assert!(offset_of!(StakePool, is_initialized) == 0);
+    // STAKE_POOL_OFF_SLAB — the wrapper market this pool is bound to.
+    assert!(offset_of!(StakePool, slab) == 8);
+    // STAKE_POOL_OFF_VAULT — THE DESTINATION. The only legal tag-87 sink.
+    assert!(offset_of!(StakePool, vault) == 136);
+    // STAKE_POOL_OFF_PERCOLATOR_PROGRAM — the wrapper this pool CPIs.
+    assert!(offset_of!(StakePool, percolator_program) == 224);
+    // STAKE_POOL_OFF_MODE — 0 = insurance-LP, the only mode owed this leg.
+    assert!(offset_of!(StakePool, pool_mode) == 280);
+    // The wrapper reads the discriminator at 320 and the version at 328. Both
+    // are carved out of `_reserved` (see the PERC-303 layout map below):
+    // `_reserved[0..8]` = discriminator, `_reserved[8]` = version. Pin the base
+    // AND the derived offsets so recarving `_reserved` also trips this.
+    assert!(offset_of!(StakePool, _reserved) == 320);
+    assert!(offset_of!(StakePool, _reserved) + 8 == 328);
+    // Total size — the wrapper's `STAKE_POOL_LEN` minimum-length gate.
+    //
+    // v4 grows this 392 -> 408 by APPENDING the two #242 timelock fields after
+    // `total_recovered_from_wrapper` (384). Every offset the wrapper reads is
+    // <= 328 and therefore unmoved, and its gate is `data.len() < STAKE_POOL_LEN`
+    // — a minimum — so a 408-byte account still passes it.
+    //
+    // BUT the wrapper also checks the version byte EXACTLY
+    // (`percolator-prog/src/v16_program.rs`: `STAKE_POOL_VERSION: u8 = 3`,
+    // `data[STAKE_POOL_OFF_VERSION] != STAKE_POOL_VERSION` -> InvalidInstruction).
+    // Shipping v4 therefore REQUIRES a coordinated wrapper bump to
+    // STAKE_POOL_VERSION = 4 / STAKE_POOL_LEN = 408 and a wrapper redeploy, or
+    // tag-87 stops paying the insurance fee leg to every stake pool.
+    assert!(STAKE_POOL_SIZE == 408);
+};
+
+/// Per-depositor state — tracks cooldown and LP amount per user.
+/// PDA seeds: [b"stake_deposit", pool_pda, user_pubkey]
+#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+#[repr(C)]
+pub struct StakeDeposit {
+    /// Whether this record is initialized
+    pub is_initialized: u8,
+
+    /// Bump seed for the deposit PDA
+    pub bump: u8,
+
+    /// Padding
+    pub _padding: [u8; 6],
+
+    /// The stake pool this deposit belongs to
+    pub pool: [u8; 32],
+
+    /// The user who deposited
+    pub user: [u8; 32],
+
+    /// Slot of last deposit (cooldown starts from here)
+    pub last_deposit_slot: u64,
+
+    /// Total LP tokens held by this user (tracked for cooldown enforcement)
+    pub lp_amount: u64,
+
+    /// Reserved for future use
+    pub _reserved: [u8; 64],
+}
+
+/// Size of StakeDeposit in bytes
+pub const STAKE_DEPOSIT_SIZE: usize = core::mem::size_of::<StakeDeposit>();
+
+impl StakeDeposit {
+    /// Set discriminator in first 8 bytes of _reserved. Call on init.
+    pub fn set_discriminator(&mut self) {
+        self._reserved[..8].copy_from_slice(&STAKE_DEPOSIT_DISCRIMINATOR);
+    }
+
+    /// Validate discriminator. Only accepts the correct discriminator bytes.
+    ///
+    /// FINDING-10: The zeroed-data branch was removed. Accepting all-zero discriminators
+    /// allows uninitialized or zeroed accounts to pass validation, enabling an attacker to
+    /// pass a freshly-allocated account as a valid deposit record. All real StakeDeposit
+    /// accounts must have been initialized via set_discriminator() and will have the correct
+    /// STAKE_DEPOSIT_DISCRIMINATOR bytes set.
+    pub fn validate_discriminator(&self) -> bool {
+        let disc = &self._reserved[..8];
+        disc == STAKE_DEPOSIT_DISCRIMINATOR
+    }
+
+    // L-3: Named tranche-flag accessor. The junior flag occupies _reserved[8]
+    // (bytes [0..8] are the discriminator). Using a named method rather than a
+    // raw index means any future _reserved layout change surfaces at compile time
+    // instead of silently corrupting tranche isolation.
+
+    /// Whether this deposit belongs to the junior tranche.
+    pub fn is_junior_deposit(&self) -> bool {
+        self._reserved[8] == 1
+    }
+
+    /// Set or clear the junior-tranche flag.
+    pub fn set_junior_deposit(&mut self, v: bool) {
+        self._reserved[8] = if v { 1 } else { 0 };
+    }
+}
+
+impl StakePool {
+    pub fn slab_pubkey(&self) -> Pubkey {
+        Pubkey::new_from_array(self.slab)
+    }
+
+    pub fn admin_pubkey(&self) -> Pubkey {
+        Pubkey::new_from_array(self.admin)
+    }
+
+    pub fn collateral_mint_pubkey(&self) -> Pubkey {
+        Pubkey::new_from_array(self.collateral_mint)
+    }
+
+    pub fn lp_mint_pubkey(&self) -> Pubkey {
+        Pubkey::new_from_array(self.lp_mint)
+    }
+
+    pub fn vault_pubkey(&self) -> Pubkey {
+        Pubkey::new_from_array(self.vault)
+    }
+
+    pub fn percolator_program_pubkey(&self) -> Pubkey {
+        Pubkey::new_from_array(self.percolator_program)
+    }
+
+    /// The pending (proposed) admin for the two-step rotation, or None if no
+    /// proposal is outstanding (pending_admin == zero).
+    pub fn pending_admin_pubkey(&self) -> Option<Pubkey> {
+        if self.pending_admin == [0u8; 32] {
+            None
+        } else {
+            Some(Pubkey::new_from_array(self.pending_admin))
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // PERC-303: Senior/Junior LP Tranche Accessors
+    // Layout in _reserved:
+    //   [0..8]   = discriminator (SPOOL_V1)
+    //   [8]      = version
+    //   [9]      = market_resolved (0=active, 1=resolved)
+    //   [10..32] = reserved for PERC-313 HWM
+    //   [32]     = tranche_enabled (0=disabled, 1=enabled)
+    //   [33..41] = junior_balance: u64 (LE)
+    //   [41..49] = junior_total_lp: u64 (LE)
+    //   [49..51] = junior_fee_mult_bps: u16 (LE, default 20000 = 2x)
+    //   [51..59] = realized_junior_loss: u64 (LE)
+    //   [59]     = asset_admin_burned (0=false, 1=true)
+    //   [60]     = fee_attribution_armed (#290; 0=legacy, 1=armed)
+    //   [61..64] = free
+    // ════════════════════════════════════════════════════════════
+
+    /// Whether the market has been resolved (blocks new deposits).
+    /// Stored at _reserved[9] to avoid conflicting with the discriminator at [0..8].
+    pub fn market_resolved(&self) -> bool {
+        self._reserved[9] != 0
+    }
+
+    /// Set the market resolved flag.
+    pub fn set_market_resolved(&mut self, resolved: bool) {
+        self._reserved[9] = if resolved { 1 } else { 0 };
+    }
+
+    /// Whether senior/junior tranches are enabled on this pool.
+    pub fn tranche_enabled(&self) -> bool {
+        self._reserved[32] == 1
+    }
+
+    /// Set tranche enabled flag.
+    pub fn set_tranche_enabled(&mut self, enabled: bool) {
+        self._reserved[32] = if enabled { 1 } else { 0 };
+    }
+
+    /// Current junior tranche balance (collateral backing junior LP tokens).
+    /// Safe read from _reserved[33..41] — panics only if array size changes structurally.
+    pub fn junior_balance(&self) -> u64 {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&self._reserved[33..41]);
+        u64::from_le_bytes(bytes)
+    }
+
+    /// Set junior tranche balance.
+    pub fn set_junior_balance(&mut self, val: u64) {
+        self._reserved[33..41].copy_from_slice(&val.to_le_bytes());
+    }
+
+    /// Total junior LP tokens in circulation.
+    /// Safe read from _reserved[41..49] — panics only if array size changes structurally.
+    pub fn junior_total_lp(&self) -> u64 {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&self._reserved[41..49]);
+        u64::from_le_bytes(bytes)
+    }
+
+    /// Set junior total LP supply.
+    pub fn set_junior_total_lp(&mut self, val: u64) {
+        self._reserved[41..49].copy_from_slice(&val.to_le_bytes());
+    }
+
+    /// Junior fee multiplier in bps (20000 = 2x).
+    /// Safe read from _reserved[49..51] — panics only if array size changes structurally.
+    pub fn junior_fee_mult_bps(&self) -> u16 {
+        let mut bytes = [0u8; 2];
+        bytes.copy_from_slice(&self._reserved[49..51]);
+        u16::from_le_bytes(bytes)
+    }
+
+    /// Set junior fee multiplier.
+    pub fn set_junior_fee_mult_bps(&mut self, val: u16) {
+        self._reserved[49..51].copy_from_slice(&val.to_le_bytes());
+    }
+
+    /// Derived: senior LP supply = total_lp_supply - junior_total_lp.
+    /// Uses saturating_sub to handle accounting drift gracefully without panicking.
+    /// If junior_total_lp exceeds total_lp_supply, returns 0 (senior has no LP).
+    pub fn senior_total_lp(&self) -> u64 {
+        self.total_lp_supply.saturating_sub(self.junior_total_lp())
+    }
+
+    /// Cumulative insurance loss that an exited junior tranche permanently REALIZED
+    /// (issue #161). Stored at `_reserved[51..59]` (LE u64).
+    ///
+    /// When the LAST junior LP exits while a loss is outstanding, the loss it absorbed
+    /// (`junior_balance − effective_junior_balance`) is forfeited: the junior took its
+    /// marked-down payout and walked away, so a later `ReturnInsurance` of that portion
+    /// must NOT flow to senior (which was protected). We settle that portion at exit
+    /// (`total_returned += L`) so it leaves the recoverable-loss ledger, and record it
+    /// here so `total_pool_value()` subtracts it — the recovered tokens then sit as DEAD
+    /// (unclaimable) value rather than windfalling senior. Conservation: vault tokens ==
+    /// junior_claims + senior_claims + realized_junior_loss(dead).
+    pub fn realized_junior_loss(&self) -> u64 {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&self._reserved[51..59]);
+        u64::from_le_bytes(bytes)
+    }
+
+    /// Set the cumulative realized (forfeited) junior loss. See `realized_junior_loss`.
+    pub fn set_realized_junior_loss(&mut self, val: u64) {
+        self._reserved[51..59].copy_from_slice(&val.to_le_bytes());
+    }
+
+    /// Whether BurnAssetAdmin has completed for this pool's market.
+    ///
+    /// Once true, stake-side rotate escapes stay disabled so the wrapper roles
+    /// cannot be moved back to an admin-controlled key after the final burn.
+    pub fn asset_admin_burned(&self) -> bool {
+        self._reserved[59] == 1
+    }
+
+    /// Set the BurnAssetAdmin completion flag. Stored at `_reserved[59]`.
+    pub fn set_asset_admin_burned(&mut self, burned: bool) {
+        self._reserved[59] = if burned { 1 } else { 0 };
+    }
+
+    /// #290: whether `mode0_fees_attributed` holds a live attribution cursor.
+    /// Stored at `_reserved[60]`. Unset on every pool created before #290, whose
+    /// offset-272 bytes still hold a stale vault-balance snapshot.
+    pub fn fee_attribution_armed(&self) -> bool {
+        self._reserved[60] == 1
+    }
+
+    /// Set the #290 fee-attribution armed flag. Stored at `_reserved[60]`.
+    pub fn set_fee_attribution_armed(&mut self, armed: bool) {
+        self._reserved[60] = if armed { 1 } else { 0 };
+    }
+
+    /// #242 timelock: the `cooldown_slots` INCREASE awaiting commit. Backed by the
+    /// dedicated [`StakePool::pending_cooldown_slots`] field (v4); it previously
+    /// aliased the PERC-313 HWM bytes at `_reserved[10..18]`. Meaningful only while
+    /// `cooldown_proposed_at_slot() != 0`.
+    pub fn pending_cooldown_slots(&self) -> u64 {
+        self.pending_cooldown_slots
+    }
+
+    /// Set the pending cooldown-increase value. See [`pending_cooldown_slots`].
+    pub fn set_pending_cooldown_slots(&mut self, val: u64) {
+        self.pending_cooldown_slots = val;
+    }
+
+    /// #242 timelock: the slot at which the pending cooldown increase was proposed.
+    /// `0` = no active proposal (the sentinel; a live mainnet slot is never 0). Backed
+    /// by the dedicated [`StakePool::cooldown_proposed_at_slot`] field (v4); it
+    /// previously aliased the PERC-313 HWM bytes at `_reserved[18..26]`.
+    pub fn cooldown_proposed_at_slot(&self) -> u64 {
+        self.cooldown_proposed_at_slot
+    }
+
+    /// Set the cooldown-increase proposal slot (`0` clears the proposal). See
+    /// [`cooldown_proposed_at_slot`].
+    pub fn set_cooldown_proposed_at_slot(&mut self, val: u64) {
+        self.cooldown_proposed_at_slot = val;
+    }
+
+    /// Loss-adjusted junior tranche balance.
+    ///
+    /// `junior_balance()` (stored) grows monotonically with deposits and withdrawals
+    /// but is NOT reduced when `total_flushed` increases (insurance loss).  Using the
+    /// raw value prices new deposits against a stale, inflated sub-pool, causing new
+    /// junior depositors to receive fewer LP tokens than their proportional share —
+    /// effectively overcharging them when prior losses have already reduced pool value.
+    ///
+    /// This method applies `distribute_loss` to compute the amount of outstanding
+    /// insurance losses that the junior tranche must absorb first, returning the
+    /// true collateral backing junior LP tokens.
+    pub fn effective_junior_balance(&self) -> u64 {
+        let jb = self.junior_balance();
+        // net_loss = total_flushed - total_returned (tokens sent to insurance but not yet returned)
+        let net_loss = self.total_flushed.saturating_sub(self.total_returned);
+        if net_loss == 0 {
+            return jb;
+        }
+        // BUG-6: Must distribute loss against the GROSS (pre-loss) balances, not the
+        // loss-adjusted pool value that total_pool_value() already returns.
+        //
+        // total_pool_value() = deposited - withdrawn - flushed + returned
+        //                    = gross_pool - net_loss
+        //
+        // If we used total_pool_value() - jb as senior_bal here, the senior_bal would
+        // already be net_loss lower than its true gross value.  Calling distribute_loss
+        // with that deflated senior_bal causes junior to absorb MORE loss than it
+        // should — i.e., the loss is applied twice against the junior side.
+        //
+        // Fix: derive gross balances as if no loss occurred yet, then apply the loss once.
+        // gross_pool = total_deposited - total_withdrawn (the monotonic principal, no flush/return)
+        let gross_pool = self.total_deposited.saturating_sub(self.total_withdrawn);
+        // gross_senior = gross_pool - jb (the stored junior_balance() is the gross junior)
+        let gross_senior = gross_pool.saturating_sub(jb);
+        let (junior_loss, _) = crate::math::distribute_loss(jb, gross_senior, net_loss);
+        jb.saturating_sub(junior_loss)
+    }
+
+    /// Derived: senior balance = total_pool_value - effective_junior_balance.
+    pub fn senior_balance(&self) -> Option<u64> {
+        self.total_pool_value()?
+            .checked_sub(self.effective_junior_balance())
+    }
+
+    /// Collateral still physically recoverable from the WRAPPER insurance fund:
+    /// `total_flushed − realized_junior_loss − total_recovered_from_wrapper`.
+    ///
+    /// This is the single source of truth for the `RecoverFlushedInsurance` cap AND
+    /// for the H-1 resolve gates. Measuring against `total_recovered_from_wrapper`
+    /// (not `total_returned`) is what makes it correct, because that counter is
+    /// monotonic, bumped ONLY after the tag-57 CPI succeeds, and bounded by
+    /// `total_flushed` — so this expression strictly decreases to 0 and the gate is
+    /// always reachable. Two live defects on the deployed v3 program came from
+    /// getting this wrong, and the two competing fixes (#262 / #270) each fixed one
+    /// while keeping the other:
+    ///
+    /// - Capping at `flushed − returned + realized_junior_loss` (#262) NEVER reaches
+    ///   zero: each recovery bumps `total_returned`, the `saturating_sub` floors at 0,
+    ///   and `realized_junior_loss` is added back — so the cap parks at
+    ///   `realized_junior_loss` forever. `RecoverFlushedInsurance` is permissionless
+    ///   post-burn, so that is an UNBOUNDED drain of the wrapper insurance fund.
+    /// - Capping at `flushed − returned` (#270, and the deployed code) can never lift
+    ///   `total_recovered_from_wrapper` to `total_flushed` once the #161 phantom
+    ///   settlement has moved `total_returned`, so the H-1 gate rejects FOREVER and the
+    ///   market can never be resolved.
+    ///
+    /// Subtracting `realized_junior_loss` is what lets the gate be satisfied without
+    /// windfalling senior. That capital was forfeited by the exiting junior, so pulling
+    /// it back would raise `total_pool_value()` above senior's principal (senior 700 ->
+    /// 1000 in the F=300/L=300 case). It stays in the wrapper insurance fund, and the
+    /// gates below are lowered by the same term so resolution is still reachable.
+    pub fn wrapper_recoverable(&self) -> u64 {
+        self.total_flushed
+            .saturating_sub(self.realized_junior_loss())
+            .saturating_sub(self.total_recovered_from_wrapper)
+    }
+
+    /// The H-1 resolve threshold: all wrapper-recoverable insurance has been pulled
+    /// back. Equivalent to `wrapper_recoverable() == 0`, named for the call sites.
+    pub fn wrapper_fully_recovered(&self) -> bool {
+        self.wrapper_recoverable() == 0
+    }
+
+    /// Tranche pools: the largest amount by which a permissionless
+    /// `RecoverFlushedInsurance` (tag 23) could raise [`StakePool::senior_balance`]
+    /// from the current state. Zero means `senior_balance()` is invariant under every
+    /// legal recovery, so a deposit priced at today's `senior_balance()` cannot be
+    /// sniping one.
+    ///
+    /// # Derivation
+    ///
+    /// A recovery raises `total_returned` (`R`), and `senior_balance()` as a function
+    /// of `R` is piecewise linear with three regions:
+    ///
+    /// - `R < F - jb` — the loss has spilled past junior; senior absorbs, slope 1.
+    /// - `F - jb <= R <= F` — junior absorbs; `effective_junior_balance()` rises by
+    ///   exactly what `total_pool_value()` does, slope 0. This is why the gate must
+    ///   not simply be `wrapper_recoverable() > 0`: that form fires here, where no
+    ///   recovery can move `senior_balance()` at all.
+    /// - `R > F` — `net_loss` has saturated, `effective_junior_balance()` is pinned at
+    ///   raw `junior_balance()`, and the whole recovery lands on senior, slope 1.
+    ///
+    /// `wrapper_recoverable()` is the cap tag 23 enforces on itself, so evaluating at
+    /// that bound gives the maximum. Both contributing terms are non-decreasing in the
+    /// recovered amount. The `above` term is the cumulative admin `ReturnInsurance`
+    /// not yet matched by a wrapper recovery, since `total_returned` has exactly three
+    /// increment sites:
+    /// `total_returned == total_recovered_from_wrapper + admin_returned + realized_junior_loss`.
+    ///
+    /// With `jb == 0` this collapses to `wrapper_recoverable()`, which is the
+    /// non-tranche gate — the two are one formula at different junior balances.
+    pub fn senior_recovery_exposure(&self) -> u64 {
+        let rec = self.wrapper_recoverable();
+        if rec == 0 {
+            // rec == 0 forces net_loss == 0 as well (it implies total_returned >=
+            // total_flushed), so both terms below would be 0 anyway. Short-circuit.
+            return 0;
+        }
+        let net_loss = self.total_flushed.saturating_sub(self.total_returned);
+        // Below the band: the portion of the loss that already spilled past junior
+        // (`distribute_loss`'s senior_loss), capped by what is actually recoverable.
+        let below = rec.min(net_loss.saturating_sub(self.junior_balance()));
+        // Above the band: recoverable stock in excess of the accounting shortfall.
+        let above = rec.saturating_sub(net_loss);
+        // below + above <= net_loss + (rec - net_loss) = rec, so this cannot overflow.
+        below.saturating_add(above)
+    }
+
+    /// Current struct version. Increment when layout changes.
+    /// v2 (size 352 -> 384): added `pending_admin` for two-step admin rotation.
+    /// v3 (size 384 -> 392): added `total_recovered_from_wrapper` (H-1 re-review
+    /// fix) — the resolve-gate counter that tracks ONLY wrapper-CPI-recovered
+    /// flushed insurance, distinct from `total_returned`.
+    /// v4 (size 392 -> 408): promoted the #242 cooldown-timelock values to the
+    /// dedicated `pending_cooldown_slots` / `cooldown_proposed_at_slot` fields,
+    /// removing their aliasing of the PERC-313 HWM bytes in `_reserved[10..26]`.
+    ///
+    /// This MUST be 4, not a second flavour of 3: v3 is live on devnet at 392
+    /// bytes, and `validate_pool_version` compares for exact equality, so reusing
+    /// 3 for a 408-byte layout would let a v3 account pass the version check and
+    /// then fail the length check in `pool_from_data`. Fresh-start cutover: live
+    /// v3 pools are re-seeded, so no on-chain migration path is provided.
+    pub const CURRENT_VERSION: u8 = 4;
+
+    /// Set discriminator in first 8 bytes of _reserved and version in byte 8.
+    /// Call on init.
+    pub fn set_discriminator(&mut self) {
+        self._reserved[..8].copy_from_slice(&STAKE_POOL_DISCRIMINATOR);
+        self._reserved[8] = Self::CURRENT_VERSION;
+    }
+
+    /// Read the struct version (byte 8 of _reserved). Returns 0 for pre-versioning accounts.
+    pub fn version(&self) -> u8 {
+        self._reserved[8]
+    }
+
+    /// Validate discriminator. Only accepts the correct discriminator bytes.
+    ///
+    /// FINDING-10: The zeroed-data branch was removed. Accepting all-zero discriminators
+    /// allows uninitialized or zeroed accounts to pass validation, enabling an attacker to
+    /// pass a freshly-allocated account as a valid pool. All real StakePool accounts must
+    /// have been initialized via set_discriminator() and will have the correct
+    /// STAKE_POOL_DISCRIMINATOR bytes set.
+    pub fn validate_discriminator(&self) -> bool {
+        let disc = &self._reserved[..8];
+        disc == STAKE_POOL_DISCRIMINATOR
+    }
+
+    // ════════════════════════════════════════════════════════════
+    // PERC-313: High-Water Mark Protection — _reserved layout
+    // ════════════════════════════════════════════════════════════
+    // Bytes 0-7:   discriminator (STAKE_POOL_DISCRIMINATOR)
+    // Byte  8:     version
+    // Byte  9:     market_resolved  ← PERC-303 (DO NOT use for HWM)
+    // Byte  10:    hwm_enabled (0 = off, 1 = on)
+    // Bytes 11-12: hwm_floor_bps (u16 LE, default 5000 = 50%)
+    // Bytes 13-15: reserved padding
+    // Bytes 16-23: epoch_high_water_tvl (u64 LE)
+    // Bytes 24-31: hwm_last_epoch (u64 LE)
+    // Bytes 32-63: used by PERC-303 tranche state + asset_admin_burned
+    //              (see layout above)
+    //
+    // CRITICAL: hwm_enabled was previously at byte 9 — the same byte used by
+    // market_resolved (PERC-303).  That collision meant enabling HWM caused the
+    // pool to appear resolved (blocking deposits), and resolving the market
+    // caused HWM to appear enabled (applying withdrawal floor post-resolution).
+    // Moved to byte 10 which PERC-303 explicitly reserved for PERC-313 HWM use.
+
+    /// Whether high-water mark protection is enabled.
+    /// Stored at _reserved[10] — byte 9 is owned by market_resolved (PERC-303).
+    pub fn hwm_enabled(&self) -> bool {
+        self._reserved[10] == 1
+    }
+
+    /// Set high-water mark enabled flag.
+    pub fn set_hwm_enabled(&mut self, enabled: bool) {
+        self._reserved[10] = if enabled { 1 } else { 0 };
+    }
+
+    /// High-water mark floor in basis points (e.g. 5000 = 50%).
+    pub fn hwm_floor_bps(&self) -> u16 {
+        u16::from_le_bytes([self._reserved[11], self._reserved[12]])
+    }
+
+    /// Set high-water mark floor bps.
+    pub fn set_hwm_floor_bps(&mut self, bps: u16) {
+        let bytes = bps.to_le_bytes();
+        self._reserved[11] = bytes[0];
+        self._reserved[12] = bytes[1];
+    }
+
+    /// Epoch high-water mark TVL (max pool value seen in current epoch).
+    /// Safe read from _reserved[16..24] — panics only if array size changes structurally.
+    pub fn epoch_high_water_tvl(&self) -> u64 {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&self._reserved[16..24]);
+        u64::from_le_bytes(bytes)
+    }
+
+    /// Set epoch high-water mark TVL.
+    pub fn set_epoch_high_water_tvl(&mut self, tvl: u64) {
+        self._reserved[16..24].copy_from_slice(&tvl.to_le_bytes());
+    }
+
+    /// Last epoch when HWM was updated.
+    /// Safe read from _reserved[24..32] — panics only if array size changes structurally.
+    pub fn hwm_last_epoch(&self) -> u64 {
+        let mut bytes = [0u8; 8];
+        bytes.copy_from_slice(&self._reserved[24..32]);
+        u64::from_le_bytes(bytes)
+    }
+
+    /// Set last HWM epoch.
+    pub fn set_hwm_last_epoch(&mut self, epoch: u64) {
+        self._reserved[24..32].copy_from_slice(&epoch.to_le_bytes());
+    }
+
+    /// Refresh HWM tracking for a new epoch. If current epoch differs from
+    /// the stored epoch, reset epoch_high_water_tvl to the current pool value.
+    /// Then update the HWM if current_tvl exceeds it.
+    /// Returns the (possibly updated) epoch_high_water_tvl.
+    pub fn refresh_hwm(&mut self, current_epoch: u64, current_tvl: u64) -> u64 {
+        if current_epoch != self.hwm_last_epoch() {
+            // New epoch — reset HWM to current TVL
+            self.set_epoch_high_water_tvl(current_tvl);
+            self.set_hwm_last_epoch(current_epoch);
+        } else if current_tvl > self.epoch_high_water_tvl() {
+            // Same epoch — raise the water mark
+            self.set_epoch_high_water_tvl(current_tvl);
+        }
+        self.epoch_high_water_tvl()
+    }
+
+    /// Total pool value = deposited - withdrawn - flushed + returned.
+    ///
+    /// This equals the actual vault balance and reflects what LP holders can withdraw.
+    /// - Flushed tokens leave the vault (moved to wrapper insurance).
+    /// - Returned tokens come back to vault (withdrawn from insurance after resolution).
+    ///
+    /// IMPORTANT: Do NOT use `deposited - withdrawn + returned` — that double-counts
+    /// because returned tokens are already in the vault, and deposited conceptually
+    /// includes the flushed amount. Missing `-flushed` causes phantom inflation
+    /// that makes the pool insolvent after any flush+return cycle.
+    pub fn total_pool_value(&self) -> Option<u64> {
+        // #169: sum in a wide SIGNED intermediate. In mode 1 a withdrawer's payout
+        // includes their share of accrued fees, so `total_withdrawn` can legitimately
+        // exceed `total_deposited` once fees have been paid out. The old left-to-right
+        // `total_deposited.checked_sub(total_withdrawn)` then underflowed to None and
+        // PERMANENTLY BRICKED the pool (LP funds trapped) even though the true value was
+        // still positive. Computing in i128 makes evaluation order irrelevant; we only
+        // fail closed when the FINAL value is genuinely out of range — i.e. negative
+        // (insolvent: claims exceed assets) or impossibly large. This preserves the
+        // insolvency guard while eliminating the false-underflow brick.
+        //
+        // PERC-272: accrued trading fees count toward a mode-1 trading pool's value.
+        // PERC-272: accrued trading fees count toward a trading pool's value.
+        // 2026-07-19: mode-0 insurance pools also accrue fees (the insurance
+        // leg of the trade-fee split), so their fees count too. Both modes now
+        // include total_fees_earned; the field is 0 for any pool that has never
+        // accrued, so this is a no-op for existing mode-0 pools.
+        let fees = self.total_fees_earned as i128;
+        // #161: subtract realized (forfeited) junior loss — dead value the exit booking
+        // added to `total_returned` but that is NOT claimable by senior. Normally 0.
+        let value = self.total_deposited as i128
+            - self.total_withdrawn as i128
+            - self.total_flushed as i128
+            + self.total_returned as i128
+            + fees
+            - self.realized_junior_loss() as i128;
+        if value < 0 || value > u64::MAX as i128 {
+            None
+        } else {
+            Some(value as u64)
+        }
+    }
+
+    /// Principal-basis TVL: `deposited − withdrawn − flushed + returned`, WITHOUT
+    /// accrued trading fees. This is the basis the deposit cap is enforced against
+    /// (issue #154): the cap limits contributed principal/exposure, not fee
+    /// appreciation. Using `total_pool_value()` (fee-inclusive) for the cap meant a
+    /// mode-1 trading pool that earned fees would silently lock out new deposits even
+    /// though contributed principal was below the cap. LP pricing still uses
+    /// `total_pool_value()` (fee-inclusive). For mode-0 pools this equals
+    /// `total_pool_value()`.
+    pub fn principal_tvl(&self) -> Option<u64> {
+        // #169: same i128 widening as total_pool_value(). In mode 1, fee-inclusive
+        // withdrawals can push total_withdrawn past total_deposited; the old checked_sub
+        // underflowed to None and bricked DEPOSITS (the cap check fails closed on None).
+        // A principal basis can't be negative, so clamp a net-negative result to 0 — no
+        // live principal means the cap simply admits new deposits, rather than bricking.
+        // #161: realized (forfeited) junior loss is dead value, excluded from the cap basis.
+        let value = self.total_deposited as i128
+            - self.total_withdrawn as i128
+            - self.total_flushed as i128
+            + self.total_returned as i128
+            - self.realized_junior_loss() as i128;
+        Some(value.clamp(0, u64::MAX as i128) as u64)
+    }
+
+    /// Calculate LP tokens for a deposit amount.
+    /// Delegates to pure math module (Kani-verified).
+    /// Returns None if pool accounting is broken (total_pool_value() underflows).
+    pub fn calc_lp_for_deposit(&self, amount: u64) -> Option<u64> {
+        let pv = self.total_pool_value()?;
+        crate::math::calc_lp_for_deposit(self.total_lp_supply, pv, amount)
+    }
+
+    /// Calculate collateral for burning LP tokens.
+    /// Delegates to pure math module (Kani-verified).
+    /// NOTE: Actual withdrawal limited by vault balance (buffer).
+    pub fn calc_collateral_for_withdraw(&self, lp_amount: u64) -> Option<u64> {
+        let pv = self.total_pool_value()?;
+        crate::math::calc_collateral_for_withdraw(self.total_lp_supply, pv, lp_amount)
+    }
+}
+
+/// Derive the stake pool PDA for a given slab.
+/// This PDA also becomes the wrapper admin after TransferAdmin.
+// ════════════════════════════════════════════════════════════════════════════
+// #290 — WRAPPER FEE-PAYOUT COUNTER (read-only cross-program layout contract)
+//
+// Mode-0 fee revenue arrives as a bare SPL transfer from the wrapper's
+// permissionless tag 87 (`WithdrawInsuranceReserveToStake`) into `pool.vault`,
+// indistinguishable on the token account from a raw donation. The wrapper does,
+// however, keep a monotonic ledger of exactly those transfers:
+// `WrapperConfigV16::insurance_reserve_withdrawn_atoms`, advanced by the
+// TRANSFERRED amount at the same site that issues the transfer, and whose only
+// legal destination is this pool's vault (`load_bound_stake_pool`). Reading it
+// lets `AccrueFees` book wrapper-paid fees and nothing else.
+//
+// Offsets (identical in the deployed wrapper a9318945 (v18), the v18.1
+// candidate 3262608b, and the CI-pinned v17 wrapper 15eb8b0c):
+//   [0..8)   MAGIC            = 0x5045_5243_5631_3600 ("PERCV16\0")
+//   [8..10)  VERSION          (17 or 18: not checked, the config layout below
+//                              is the same in both)
+//   [10]     kind             = KIND_MARKET (1)
+//   [16..592) WrapperConfigV16 (WRAPPER_CONFIG_LEN = 576); its four u128 fee
+//            counters sit at config 496..560 in the order lp_accrued,
+//            lp_withdrawn, insurance_reserve_accrued, insurance_reserve_withdrawn
+//   => insurance_reserve_withdrawn_atoms = account bytes [560..576), u128 LE.
+//
+// `tests/mode0_fee_attribution_e2e.rs` pins this against a REAL wrapper .so by
+// checking the neighbouring fee-share defaults (1600/4800/1600) at [576..582).
+// If the wrapper ever moves this field, that test fails; update the constant
+// here and redeploy together.
+// ════════════════════════════════════════════════════════════════════════════
+pub const WRAPPER_MAGIC: u64 = 0x5045_5243_5631_3600;
+pub const WRAPPER_KIND_MARKET: u8 = 1;
+pub const WRAPPER_OFF_KIND: usize = 10;
+pub const WRAPPER_OFF_INSURANCE_RESERVE_WITHDRAWN: usize = 16 + 544;
+
+/// Read `insurance_reserve_withdrawn_atoms` from a wrapper market account's raw
+/// bytes. Returns `None` if the account is too short, is not initialized with the
+/// wrapper magic, or is not a market (e.g. a closed-market tombstone).
+pub fn read_wrapper_insurance_reserve_withdrawn(data: &[u8]) -> Option<u128> {
+    let end = WRAPPER_OFF_INSURANCE_RESERVE_WITHDRAWN.checked_add(16)?;
+    if data.len() < end {
+        return None;
+    }
+    let magic = u64::from_le_bytes(data[0..8].try_into().ok()?);
+    if magic != WRAPPER_MAGIC || data[WRAPPER_OFF_KIND] != WRAPPER_KIND_MARKET {
+        return None;
+    }
+    Some(u128::from_le_bytes(
+        data[WRAPPER_OFF_INSURANCE_RESERVE_WITHDRAWN..end]
+            .try_into()
+            .ok()?,
+    ))
+}
+
+pub fn derive_pool_pda(program_id: &Pubkey, slab: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"stake_pool", slab.as_ref()], program_id)
+}
+
+/// Derive the vault authority PDA for a given pool.
+/// Controls: LP mint authority + vault token account authority.
+pub fn derive_vault_authority(program_id: &Pubkey, pool: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[b"vault_auth", pool.as_ref()], program_id)
+}
+
+/// Derive the per-user deposit PDA.
+pub fn derive_deposit_pda(program_id: &Pubkey, pool: &Pubkey, user: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[b"stake_deposit", pool.as_ref(), user.as_ref()],
+        program_id,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn wrapper_market_bytes(counter: u128) -> Vec<u8> {
+        let mut d = vec![0u8; 592];
+        d[0..8].copy_from_slice(&WRAPPER_MAGIC.to_le_bytes());
+        d[8..10].copy_from_slice(&18u16.to_le_bytes());
+        d[WRAPPER_OFF_KIND] = WRAPPER_KIND_MARKET;
+        d[WRAPPER_OFF_INSURANCE_RESERVE_WITHDRAWN..WRAPPER_OFF_INSURANCE_RESERVE_WITHDRAWN + 16]
+            .copy_from_slice(&counter.to_le_bytes());
+        d
+    }
+
+    #[test]
+    fn test_290_read_wrapper_counter() {
+        assert_eq!(WRAPPER_OFF_INSURANCE_RESERVE_WITHDRAWN, 560);
+        assert_eq!(
+            read_wrapper_insurance_reserve_withdrawn(&wrapper_market_bytes(123_456)),
+            Some(123_456)
+        );
+        // Too short.
+        assert_eq!(read_wrapper_insurance_reserve_withdrawn(&[0u8; 575]), None);
+        // Wrong magic.
+        let mut d = wrapper_market_bytes(1);
+        d[0] ^= 1;
+        assert_eq!(read_wrapper_insurance_reserve_withdrawn(&d), None);
+        // Not a market (e.g. portfolio kind 2, or a tombstone).
+        let mut d = wrapper_market_bytes(1);
+        d[WRAPPER_OFF_KIND] = 2;
+        assert_eq!(read_wrapper_insurance_reserve_withdrawn(&d), None);
+    }
+
+    #[test]
+    fn test_290_attribution_flag_is_reserved_60_and_independent() {
+        let mut p = StakePool::zeroed();
+        assert!(!p.fee_attribution_armed());
+        p.set_fee_attribution_armed(true);
+        assert_eq!(p._reserved[60], 1);
+        assert!(!p.asset_admin_burned(), "[59] untouched");
+        assert_eq!(p.realized_junior_loss(), 0, "[51..59] untouched");
+        p.set_asset_admin_burned(true);
+        assert!(p.fee_attribution_armed());
+        p.set_fee_attribution_armed(false);
+        assert!(p.asset_admin_burned());
+    }
+
+    #[test]
+    fn test_stake_pool_size() {
+        // Ensure struct is packed correctly (no surprise padding)
+        assert_eq!(STAKE_POOL_SIZE, std::mem::size_of::<StakePool>());
+        // v4 size: v3's 392 + pending_cooldown_slots[8] + cooldown_proposed_at_slot[8]
+        //   = 408. Both APPENDED after total_recovered_from_wrapper (384), so no
+        //   existing offset moves.
+        assert_eq!(STAKE_POOL_SIZE, 408);
+    }
+
+    #[test]
+    fn test_stake_deposit_size() {
+        assert_eq!(STAKE_DEPOSIT_SIZE, std::mem::size_of::<StakeDeposit>());
+        // 1+1+6 + 2*32 + 2*8 + 64 = 8 + 64 + 16 + 64 = 152
+        assert_eq!(STAKE_DEPOSIT_SIZE, 152);
+    }
+
+    #[test]
+    fn test_pool_value_normal() {
+        let mut pool = StakePool::zeroed();
+        pool.total_deposited = 1000;
+        pool.total_withdrawn = 300;
+        pool.total_flushed = 0;
+        pool.total_returned = 0;
+        assert_eq!(pool.total_pool_value(), Some(700));
+    }
+
+    #[test]
+    fn test_pool_value_with_flush() {
+        let mut pool = StakePool::zeroed();
+        pool.total_deposited = 1000;
+        pool.total_withdrawn = 0;
+        pool.total_flushed = 500;
+        pool.total_returned = 0;
+        // Flushed reduces accessible value: 1000 - 0 - 500 + 0 = 500
+        assert_eq!(pool.total_pool_value(), Some(500));
+    }
+
+    #[test]
+    fn test_pool_value_with_flush_and_returns() {
+        let mut pool = StakePool::zeroed();
+        pool.total_deposited = 1000;
+        pool.total_withdrawn = 300;
+        pool.total_flushed = 500;
+        pool.total_returned = 200;
+        // 1000 - 300 - 500 + 200 = 400
+        assert_eq!(pool.total_pool_value(), Some(400));
+    }
+
+    #[test]
+    fn test_pool_value_full_return_conservation() {
+        let mut pool = StakePool::zeroed();
+        pool.total_deposited = 1000;
+        pool.total_withdrawn = 0;
+        pool.total_flushed = 500;
+        pool.total_returned = 500;
+        // Full return: 1000 - 0 - 500 + 500 = 1000 (back to original)
+        assert_eq!(pool.total_pool_value(), Some(1000));
+    }
+
+    #[test]
+    fn test_pool_value_overdrawn() {
+        let mut pool = StakePool::zeroed();
+        pool.total_deposited = 100;
+        pool.total_withdrawn = 200;
+        assert_eq!(pool.total_pool_value(), None);
+    }
+
+    #[test]
+    fn test_pool_value_overflushed() {
+        let mut pool = StakePool::zeroed();
+        pool.total_deposited = 1000;
+        pool.total_withdrawn = 0;
+        pool.total_flushed = 1001;
+        // Can't flush more than deposited-withdrawn → None
+        assert_eq!(pool.total_pool_value(), None);
+    }
+
+    #[test]
+    fn test_calc_lp_first_depositor() {
+        let mut pool = StakePool::zeroed();
+        pool.total_deposited = 0;
+        pool.total_withdrawn = 0;
+        pool.total_lp_supply = 0;
+        assert_eq!(pool.calc_lp_for_deposit(1000), Some(1000));
+    }
+
+    #[test]
+    fn test_calc_lp_pro_rata() {
+        let mut pool = StakePool::zeroed();
+        pool.total_deposited = 2000;
+        pool.total_withdrawn = 0;
+        pool.total_lp_supply = 1000;
+        // deposit 500 → 500 * 1000 / 2000 = 250
+        assert_eq!(pool.calc_lp_for_deposit(500), Some(250));
+    }
+
+    #[test]
+    fn test_calc_lp_broken_accounting_returns_none() {
+        // total_withdrawn > total_deposited: accounting underflow.
+        // calc_lp_for_deposit must propagate None, not silently treat pv as 0.
+        let mut pool = StakePool::zeroed();
+        pool.total_deposited = 100;
+        pool.total_withdrawn = 200;
+        pool.total_lp_supply = 50;
+        assert_eq!(pool.calc_lp_for_deposit(100), None);
+    }
+
+    #[test]
+    fn test_calc_lp_first_depositor_still_works() {
+        // Fresh pool: total_pool_value() returns Some(0), not None.
+        // First deposit must still get 1:1 LP tokens.
+        let pool = StakePool::zeroed();
+        assert_eq!(pool.total_pool_value(), Some(0));
+        assert_eq!(pool.calc_lp_for_deposit(1000), Some(1000));
+    }
+
+    #[test]
+    fn test_calc_lp_fully_flushed_pool_blocks_deposit() {
+        // Pool fully flushed to insurance: pv=0 but lp_supply>0.
+        // New deposits must be blocked to protect existing LP claims.
+        let mut pool = StakePool::zeroed();
+        pool.total_deposited = 1000;
+        pool.total_flushed = 1000;
+        pool.total_lp_supply = 100;
+        assert_eq!(pool.total_pool_value(), Some(0));
+        assert_eq!(pool.calc_lp_for_deposit(100), None);
+    }
+
+    #[test]
+    fn test_calc_collateral_proportional() {
+        let mut pool = StakePool::zeroed();
+        pool.total_deposited = 2000;
+        pool.total_withdrawn = 0;
+        pool.total_lp_supply = 1000;
+        // N7: burn 250 LP -> 250 * (2000+1) / (1000+1) = 499.75... -> floor 499
+        // (was exact 500 pre-offset; see math::VIRTUAL_SHARES/VIRTUAL_ASSETS).
+        assert_eq!(pool.calc_collateral_for_withdraw(250), Some(499));
+    }
+
+    #[test]
+    fn test_pda_derivation_deterministic() {
+        let program_id = Pubkey::new_unique();
+        let slab = Pubkey::new_unique();
+
+        let (pda1, bump1) = derive_pool_pda(&program_id, &slab);
+        let (pda2, bump2) = derive_pool_pda(&program_id, &slab);
+        assert_eq!(pda1, pda2);
+        assert_eq!(bump1, bump2);
+    }
+
+    #[test]
+    fn test_pda_different_slabs_different_pdas() {
+        let program_id = Pubkey::new_unique();
+        let slab1 = Pubkey::new_unique();
+        let slab2 = Pubkey::new_unique();
+
+        let (pda1, _) = derive_pool_pda(&program_id, &slab1);
+        let (pda2, _) = derive_pool_pda(&program_id, &slab2);
+        assert_ne!(pda1, pda2);
+    }
+
+    #[test]
+    fn test_vault_auth_derives_from_pool() {
+        let program_id = Pubkey::new_unique();
+        let slab = Pubkey::new_unique();
+
+        let (pool_pda, _) = derive_pool_pda(&program_id, &slab);
+        let (vault_auth, _) = derive_vault_authority(&program_id, &pool_pda);
+
+        // vault_auth should be different from pool
+        assert_ne!(vault_auth, pool_pda);
+
+        // Should be deterministic
+        let (vault_auth2, _) = derive_vault_authority(&program_id, &pool_pda);
+        assert_eq!(vault_auth, vault_auth2);
+    }
+
+    #[test]
+    fn test_deposit_pda_per_user() {
+        let program_id = Pubkey::new_unique();
+        let pool = Pubkey::new_unique();
+        let user1 = Pubkey::new_unique();
+        let user2 = Pubkey::new_unique();
+
+        let (dep1, _) = derive_deposit_pda(&program_id, &pool, &user1);
+        let (dep2, _) = derive_deposit_pda(&program_id, &pool, &user2);
+        assert_ne!(dep1, dep2);
+    }
+
+    #[test]
+    fn test_deposit_pda_per_pool() {
+        let program_id = Pubkey::new_unique();
+        let pool1 = Pubkey::new_unique();
+        let pool2 = Pubkey::new_unique();
+        let user = Pubkey::new_unique();
+
+        let (dep1, _) = derive_deposit_pda(&program_id, &pool1, &user);
+        let (dep2, _) = derive_deposit_pda(&program_id, &pool2, &user);
+        assert_ne!(dep1, dep2);
+    }
+
+    #[test]
+    fn test_pubkey_helpers() {
+        let mut pool = StakePool::zeroed();
+        let key = Pubkey::new_unique();
+        pool.slab = key.to_bytes();
+        assert_eq!(pool.slab_pubkey(), key);
+
+        let admin = Pubkey::new_unique();
+        pool.admin = admin.to_bytes();
+        assert_eq!(pool.admin_pubkey(), admin);
+    }
+
+    // ── PERC-313: HWM Accessors ──
+
+    #[test]
+    fn test_hwm_defaults_zero() {
+        let pool = StakePool::zeroed();
+        assert!(!pool.hwm_enabled());
+        assert_eq!(pool.hwm_floor_bps(), 0);
+        assert_eq!(pool.epoch_high_water_tvl(), 0);
+        assert_eq!(pool.hwm_last_epoch(), 0);
+    }
+
+    #[test]
+    fn test_hwm_set_enabled() {
+        let mut pool = StakePool::zeroed();
+        pool.set_hwm_enabled(true);
+        assert!(pool.hwm_enabled());
+        pool.set_hwm_enabled(false);
+        assert!(!pool.hwm_enabled());
+    }
+
+    #[test]
+    fn test_hwm_set_floor_bps() {
+        let mut pool = StakePool::zeroed();
+        pool.set_hwm_floor_bps(5000);
+        assert_eq!(pool.hwm_floor_bps(), 5000);
+        pool.set_hwm_floor_bps(10_000);
+        assert_eq!(pool.hwm_floor_bps(), 10_000);
+    }
+
+    #[test]
+    fn test_hwm_set_epoch_tvl() {
+        let mut pool = StakePool::zeroed();
+        pool.set_epoch_high_water_tvl(1_000_000);
+        assert_eq!(pool.epoch_high_water_tvl(), 1_000_000);
+    }
+
+    #[test]
+    fn test_hwm_set_last_epoch() {
+        let mut pool = StakePool::zeroed();
+        pool.set_hwm_last_epoch(42);
+        assert_eq!(pool.hwm_last_epoch(), 42);
+    }
+
+    #[test]
+    fn test_refresh_hwm_new_epoch_resets() {
+        let mut pool = StakePool::zeroed();
+        pool.set_hwm_last_epoch(5);
+        pool.set_epoch_high_water_tvl(2000);
+        // New epoch — should reset to current TVL
+        let hwm = pool.refresh_hwm(6, 1500);
+        assert_eq!(hwm, 1500);
+        assert_eq!(pool.hwm_last_epoch(), 6);
+    }
+
+    #[test]
+    fn test_refresh_hwm_same_epoch_raises() {
+        let mut pool = StakePool::zeroed();
+        pool.set_hwm_last_epoch(5);
+        pool.set_epoch_high_water_tvl(1000);
+        // Same epoch, higher TVL — should raise
+        let hwm = pool.refresh_hwm(5, 1500);
+        assert_eq!(hwm, 1500);
+    }
+
+    #[test]
+    fn test_refresh_hwm_same_epoch_no_lower() {
+        let mut pool = StakePool::zeroed();
+        pool.set_hwm_last_epoch(5);
+        pool.set_epoch_high_water_tvl(2000);
+        // Same epoch, lower TVL — should NOT lower the mark
+        let hwm = pool.refresh_hwm(5, 1500);
+        assert_eq!(hwm, 2000);
+    }
+
+    #[test]
+    fn test_hwm_does_not_clobber_discriminator() {
+        let mut pool = StakePool::zeroed();
+        pool.set_discriminator();
+        let disc_before: [u8; 8] = pool._reserved[..8].try_into().unwrap();
+
+        pool.set_hwm_enabled(true);
+        pool.set_hwm_floor_bps(5000);
+        pool.set_epoch_high_water_tvl(1_000_000);
+        pool.set_hwm_last_epoch(42);
+
+        let disc_after: [u8; 8] = pool._reserved[..8].try_into().unwrap();
+        assert_eq!(
+            disc_before, disc_after,
+            "HWM must not clobber discriminator"
+        );
+        assert_eq!(
+            pool.version(),
+            StakePool::CURRENT_VERSION,
+            "HWM must not clobber version"
+        );
+    }
+
+    // ── PERC-8422: PR#94 State Collision Unit Tests ──
+
+    /// Verify hwm_enabled and market_resolved are at distinct byte offsets.
+    #[test]
+    fn test_hwm_and_market_resolved_independent() {
+        let mut pool = StakePool::zeroed();
+        pool.set_discriminator();
+
+        // Enable HWM → market_resolved must stay false
+        pool.set_hwm_enabled(true);
+        assert!(pool.hwm_enabled());
+        assert!(
+            !pool.market_resolved(),
+            "hwm_enabled clobbered market_resolved"
+        );
+
+        // Resolve market → hwm_enabled must stay true
+        pool.set_market_resolved(true);
+        assert!(pool.market_resolved());
+        assert!(pool.hwm_enabled(), "market_resolved clobbered hwm_enabled");
+
+        // Disable HWM → market_resolved must stay true
+        pool.set_hwm_enabled(false);
+        assert!(!pool.hwm_enabled());
+        assert!(
+            pool.market_resolved(),
+            "clearing hwm_enabled cleared market_resolved"
+        );
+
+        // Unresolve market → hwm_enabled must stay false
+        pool.set_market_resolved(false);
+        assert!(!pool.market_resolved());
+        assert!(!pool.hwm_enabled());
+    }
+
+    /// Verify byte offsets: market_resolved at [9], hwm_enabled at [10].
+    #[test]
+    fn test_state_layout_byte_offsets() {
+        let mut pool = StakePool::zeroed();
+        pool.set_discriminator();
+
+        pool.set_market_resolved(true);
+        assert_eq!(pool._reserved[9], 1, "market_resolved should be at byte 9");
+        assert_eq!(pool._reserved[10], 0, "byte 10 should be untouched");
+
+        pool.set_market_resolved(false);
+        pool.set_hwm_enabled(true);
+        assert_eq!(pool._reserved[9], 0, "byte 9 should be untouched");
+        assert_eq!(pool._reserved[10], 1, "hwm_enabled should be at byte 10");
+    }
+
+    #[test]
+    fn test_asset_admin_burned_flag_uses_reserved_byte_59() {
+        let mut pool = StakePool::zeroed();
+        assert!(!pool.asset_admin_burned());
+
+        pool.set_realized_junior_loss(0x0102_0304_0506_0708);
+        pool.set_asset_admin_burned(true);
+
+        assert!(pool.asset_admin_burned());
+        assert_eq!(
+            pool._reserved[59], 1,
+            "asset_admin_burned should be byte 59"
+        );
+        assert_eq!(
+            pool.realized_junior_loss(),
+            0x0102_0304_0506_0708,
+            "asset_admin_burned must not clobber realized_junior_loss"
+        );
+
+        pool.set_asset_admin_burned(false);
+        assert!(!pool.asset_admin_burned());
+        assert_eq!(pool._reserved[59], 0);
+        assert_eq!(pool.realized_junior_loss(), 0x0102_0304_0506_0708);
+    }
+
+    #[test]
+    fn test_pool_value_returns_overflow() {
+        let mut pool = StakePool::zeroed();
+        pool.total_deposited = u64::MAX;
+        pool.total_withdrawn = 0;
+        pool.total_flushed = 0;
+        pool.total_returned = 1;
+        // u64::MAX - 0 - 0 + 1 overflows → None
+        assert_eq!(pool.total_pool_value(), None);
+    }
+}

@@ -1,0 +1,131 @@
+use solana_program::program_error::ProgramError;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum StakeError {
+    /// Pool already initialized for this slab
+    AlreadyInitialized = 0,
+    /// Pool not initialized
+    NotInitialized = 1,
+    /// Unauthorized — not admin
+    Unauthorized = 2,
+    /// Cooldown period not elapsed
+    CooldownNotElapsed = 3,
+    /// Insufficient LP tokens
+    InsufficientLpTokens = 4,
+    /// Zero amount
+    ZeroAmount = 5,
+    /// Arithmetic overflow
+    Overflow = 6,
+    /// Invalid mint — LP mint mismatch
+    InvalidMint = 7,
+    /// Market is resolved — no new deposits
+    MarketResolved = 8,
+    /// Deposit cap exceeded
+    DepositCapExceeded = 9,
+    /// Invalid PDA derivation
+    InvalidPda = 10,
+    /// Deprecated (was AdminAlreadyTransferred) — code kept for stable numbering
+    _DeprecatedAdminAlreadyTransferred = 11,
+    /// Deprecated (was AdminNotTransferred) — code kept for stable numbering
+    _DeprecatedAdminNotTransferred = 12,
+    /// Insufficient vault balance for withdrawal
+    InsufficientVaultBalance = 13,
+    /// Invalid percolator program ID
+    InvalidPercolatorProgram = 14,
+    /// CPI to percolator failed
+    CpiFailed = 15,
+    /// Invalid account ownership
+    InvalidAccount = 16,
+    /// Pool mode mismatch (e.g., AccrueFees on insurance pool)
+    InvalidPoolMode = 17,
+    /// Withdrawal blocked: would breach HWM floor
+    WithdrawalBelowHwmFloor = 18,
+    /// Tranches not enabled on this pool
+    TrancheNotEnabled = 19,
+    /// Junior tranche has insufficient balance for this operation
+    JuniorBalanceInsufficient = 20,
+    /// Wrong tranche — deposit PDA already belongs to a different tranche
+    WrongTranche = 21,
+    /// S-4: A deposit would mint zero LP shares (amount too small relative to
+    /// share price, or degenerate pool state). Rejected explicitly so a deposit
+    /// can never silently mint 0 LP while collateral is transferred in. Distinct
+    /// from ZeroAmount (which means the requested amount itself was 0).
+    ZeroSharesMinted = 22,
+    /// Two-step admin rotation: no pending admin proposal exists (or it was
+    /// cancelled), so AcceptAdmin has nothing to accept.
+    NoPendingAdmin = 23,
+    /// Reused across multiple gates that share the same underlying condition:
+    /// `total_flushed > total_returned` (flushed-but-unrecovered insurance).
+    /// - Junior tranche deposits are paused while an insurance loss is outstanding:
+    ///   a junior depositing during an open claim would inherit a pre-existing
+    ///   loss it was never exposed to (and the mirror case could snipe the
+    ///   recovery). Deposits resume once insurance is returned.
+    /// - H-1 (security review): `AdminResolveMarket` (tag 24) and `SetMarketResolved`
+    ///   (tag 18) both reject while this condition holds, because once the wrapper
+    ///   market is resolved (mode != 0), `RecoverFlushedInsurance`'s only CPI
+    ///   (wrapper tag 57 WithdrawInsuranceAsset) permanently rejects with
+    ///   EngineLockActive — any outstanding flush would otherwise be stranded.
+    ///   Call `RecoverFlushedInsurance` until fully caught up before resolving.
+    InsuranceLossOutstanding = 24,
+    /// #242 timelock: a `cooldown_slots` INCREASE must go through the two-phase
+    /// timelock (ProposeCooldownIncrease → wait TIMELOCK_SLOTS → CommitCooldownIncrease),
+    /// not the immediate UpdateConfig path. A decrease or unchanged value is still
+    /// allowed via UpdateConfig.
+    CooldownIncreaseRequiresTimelock = 25,
+    /// #242 timelock: CommitCooldownIncrease was called before TIMELOCK_SLOTS had
+    /// elapsed since the proposal. LP holders are still inside their exit window.
+    TimelockNotElapsed = 26,
+    /// #242 timelock: CommitCooldownIncrease / CancelCooldownIncrease with no active
+    /// proposal (cooldown_proposed_at_slot == 0).
+    NoPendingCooldownProposal = 27,
+    /// N7 (CONSOLIDATED-PLAN §2.2): the pool's true genesis deposit (total_lp_supply
+    /// == 0 && total_pool_value == 0) must exceed MINIMUM_LIQUIDITY so the
+    /// permanently-locked dead-share amount can be carved out of it. Deposits at or
+    /// below MINIMUM_LIQUIDITY at genesis are rejected rather than silently minting
+    /// 0 (or underflowing) LP to the first depositor.
+    DepositBelowMinimumLiquidity = 28,
+}
+
+impl From<StakeError> for ProgramError {
+    fn from(e: StakeError) -> Self {
+        ProgramError::Custom(e as u32)
+    }
+}
+
+/// Get user-friendly hint text for an error code.
+/// Useful for off-chain clients and SDKs to provide actionable error guidance.
+pub fn error_hint(code: u32) -> &'static str {
+    match code {
+        0 => "Pool already initialized — use a different slab address or check if InitPool was already called",
+        1 => "Pool not initialized — call InitPool first to create the stake pool",
+        2 => "Unauthorized — you must be the pool admin to perform this action",
+        3 => "Cooldown not elapsed — wait for the cooldown period before withdrawing again",
+        4 => "Insufficient LP tokens — you don't have enough LP tokens to burn",
+        5 => "Zero amount — deposit and withdrawal amounts must be greater than zero",
+        6 => "Arithmetic overflow — pool values exceeded u64 bounds, operation blocked",
+        7 => "Invalid mint — LP mint doesn't match the pool's LP mint",
+        8 => "Market is resolved — no new deposits allowed after resolution",
+        9 => "Deposit cap exceeded — pool has reached its maximum deposit limit",
+        10 => "Invalid PDA — account is not a valid PDA for the expected seed",
+        11 => "Admin already transferred — transfer admin is a one-time operation",
+        12 => "Admin not yet transferred — call TransferAdmin before performing admin operations",
+        13 => "Insufficient vault balance — vault doesn't have enough collateral for this withdrawal",
+        14 => "Invalid percolator program — percolator program ID doesn't match",
+        15 => "CPI to percolator failed — the cross-program invoke to percolator failed",
+        16 => "Invalid account — account is not owned by the expected program or is not writable",
+        17 => "Pool mode mismatch — operation not valid for this pool's mode (e.g., AccrueFees on insurance pool)",
+        18 => "Withdrawal blocked — would breach high-water mark floor protection",
+        19 => "Tranches not enabled — senior/junior tranches are not enabled on this pool",
+        20 => "Junior balance insufficient — junior tranche doesn't have enough balance for this operation",
+        21 => "Wrong tranche — deposit already belongs to a different tranche",
+        22 => "Zero shares minted — deposit amount too small to mint any LP at the current share price; increase the amount",
+        23 => "No pending admin — there is no admin transfer to accept (propose one first, or it was cancelled)",
+        24 => "Insurance loss outstanding — total_flushed > total_returned. Junior tranche deposits are paused, and AdminResolveMarket/SetMarketResolved are blocked until RecoverFlushedInsurance fully returns the flushed insurance (resolving first would strand it — recovery requires LIVE mode)",
+        25 => "Cooldown increase requires a timelock — raising the cooldown is not immediate; propose it first, then apply it once the timelock has elapsed (#242)",
+        26 => "Timelock not elapsed — the proposed cooldown increase is not yet applicable; wait for the timelock window to pass (#242)",
+        27 => "No pending cooldown proposal — there is no proposed cooldown increase to apply; propose one first, or it was cancelled (#242)",
+        28 => "Deposit below minimum liquidity — the pool's first-ever deposit must exceed MINIMUM_LIQUIDITY so a permanent dead-share floor can be locked (N7 anti-inflation hardening); deposit a larger amount",
+        _ => "Unknown error — check the error code and pool state",
+    }
+}

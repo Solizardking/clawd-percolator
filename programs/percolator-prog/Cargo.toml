@@ -1,0 +1,96 @@
+[package]
+name = "percolator-prog"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "percolator_prog"
+path = "src/v16_program.rs"
+
+[features]
+# v16 deploys through the Anchor v2 / Pinocchio entrypoint by default. The
+# Solana 1.18 bundled SBF toolchain cannot parse the current Anchor v2
+# dependency graph; use platform-tools v1.52 or newer for deployable builds.
+# `--no-default-features` remains available for legacy local compatibility.
+default = ["anchor-v2"]
+no-entrypoint = []
+test-sbf = []
+cu-audit = []  # Enable compute unit checkpoints for CU auditing
+kani = []
+anchor-v2 = ["dep:anchor-lang-v2"]
+# v16 is account-local and has no slab-wide account-count tier. These
+# feature names are no-ops so old local commands continue to build without
+# changing the deployed code shape.
+small = []
+medium = []
+# Compiles the DEVNET percolator-stake program id into `constants::STAKE_PROGRAM_ID`,
+# which tag 87 (`WithdrawInsuranceReserveToStake`) pins its stake-pool owner check
+# and PDA derivations to. Mirrors percolator-stake's own `devnet` feature and its
+# N-3 rationale: a devnet id must never compile into a mainnet binary, so that a
+# compromised devnet deploy keypair cannot inherit mainnet authority. v17
+# percolator-stake has NO mainnet deployment, so a default (non-devnet) build has
+# no pinned id and tag 87 fails closed with `StakeProgramNotPinned`.
+devnet = []
+
+[dependencies]
+solana-program = "1.18"
+spl-token = { version = "4.0", features = ["no-entrypoint"] }
+thiserror = "1.0"
+bytemuck = { version = "1.14", features = ["derive", "min_const_generics"] }
+pyth-sdk-solana = "0.10"
+# pythnet-sdk (no default features) exposes the canonical
+# PriceFeedMessage struct used inside Pyth Solana Receiver's
+# PriceUpdateV2 account. Using this official struct's BorshDeserialize
+# swaps the prior hand-rolled fixed-offset parser for a compile-time
+# typed binding: any breaking layout change on the Pyth side produces a
+# build error (missing/reordered fields) or a deserialize error at
+# runtime, rather than silent garbage reads. Pulled with
+# no-default-features to keep the transitive closure light (~52 crates,
+# no Anchor).
+pythnet-sdk = { version = "2.3", default-features = false }
+# pythnet-sdk uses borsh 0.10 internally; pin the same major so our
+# direct use of BorshDeserialize on its types reads/writes the same
+# wire format.
+borsh = { version = "0.10", default-features = false }
+pinocchio = "0.6"
+arrayref = "0.3"
+num-derive = "0.4"
+num-traits = "0.2"
+# v17 engine (zero-copy only, fork-facade enabled for re-expressed fork
+# features: A-1/A-4/A-6/A-9/A-10 + lp_vault module). runtime-vec-api DROPPED
+# per v17 convergence Standing Decision 1.
+percolator = { path = "../percolator", features = ["fork-facade"] }
+anchor-lang-v2 = { git = "https://github.com/solana-foundation/anchor", rev = "e3cf760826fa0a60f247635ea0572e59861ec9b5", package = "anchor-lang-v2", default-features = false, features = ["alloc", "guardrails"], optional = true }
+
+[target.'cfg(not(target_os = "solana"))'.dependencies]
+# Host tests use the zero-copy account/view API (same as SBF target).
+# runtime-vec-api removed — single path per v17 convergence.
+# audit-scan: enables validate_dynamic_market_slot_shape_at in the engine for
+# host-only test builds so that validate_unconfigured_market_tail exercises
+# the full tail-corruption check. Excluded from SBF target (no cfg(solana)).
+percolator = { path = "../percolator", features = ["fork-facade", "audit-scan"] }
+
+[dev-dependencies]
+bincode = "1"
+solana-sdk = "1.18"
+solana-client = "1.18"
+rand = "0.8"
+rand_xorshift = "0.3"
+proptest = "1.4"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+serial_test = "3"
+litesvm = "0.1"
+shellexpand = "3"
+serde_json = "1"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(kani)',
+    'cfg(target_os, values("solana"))',
+    'cfg(feature, values("custom-heap", "custom-panic", "idl-build"))',
+] }
+
+[profile.release]
+overflow-checks = true

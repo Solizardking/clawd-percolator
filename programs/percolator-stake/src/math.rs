@@ -1,0 +1,1158 @@
+//! Pure LP math — extracted for Kani formal verification.
+//!
+//! No Solana/Pubkey dependencies. Just arithmetic.
+//! Kani can verify these functions exhaustively.
+
+/// N7 hardening (CONSOLIDATED-PLAN §2.2): virtual shares/assets added to both
+/// sides of the pro-rata LP pricing ratio, ERC4626-"decimals offset"-style.
+/// Without this, a pool with a small real supply/value is priced using ONLY
+/// the tracked counters — an attacker who becomes sole/first LP holder, then
+/// donates raw collateral directly to the vault token account (bypassing
+/// `Deposit`) and cranks the permissionless `AccrueFees` (BOTH pool modes since
+/// 2026-07-19 — mode-0 insurance pools also accrue fees, so `state.rs`'s
+/// `total_pool_value()` folds `total_fees_earned` in for mode 0 as well; this
+/// comment previously said "mode-1 pools only", which is stale and understated
+/// the reach, because `InitPool` hardcodes mode 0 and the processor notes that
+/// "every real client calls InitPool (mode 0)"),
+/// could book that donation as "fees" and inflate the tracked share price
+/// arbitrarily cheaply (the donation stays 100% attacker-owned the whole
+/// time — a later victim `Deposit` then rounds `calc_lp_for_deposit` down to
+/// 0 and reverts with `ZeroSharesMinted`, DoSing every deposit below the
+/// inflated price). Adding a fixed virtual offset to BOTH the numerator and
+/// denominator of the pro-rata ratio makes every donation-then-accrue round
+/// cost the attacker a small, permanent, unrecoverable dilution against the
+/// virtual (unowned) share — the classic single-asset-vault countermeasure.
+///
+/// #290 UPDATE: for mode-0 pools the donation half of this vector is now closed at
+/// the source. `AccrueFees` and the pre-accrue guard book surplus only up to the
+/// wrapper's not-yet-booked tag-87 payouts (`processor.rs::accrue_fees_inner`), so
+/// a raw donation no longer moves a mode-0 share price at all. The offset and the
+/// MINIMUM_LIQUIDITY lock remain the defense for mode-1 pools, and remain
+/// defense-in-depth for mode 0.
+/// Kept at the minimal canonical value of 1 (not scaled to token decimals):
+/// larger offsets would materially reprice small-magnitude test/production
+/// pools (see math.rs unit tests), and the primary defense against the
+/// donation attack described above is the MINIMUM_LIQUIDITY dead-share lock
+/// applied by the caller (`processor.rs::process_deposit`) at genesis
+/// deposit — this offset is deliberate defense-in-depth on top of that, not
+/// the sole mitigation.
+const VIRTUAL_SHARES: u128 = 1;
+const VIRTUAL_ASSETS: u128 = 1;
+
+/// Calculate LP tokens for a deposit.
+///
+/// # Arguments
+/// * `total_lp_supply` - Current total LP tokens in circulation
+/// * `total_pool_value` - Current total pool value (deposited - withdrawn)
+/// * `deposit_amount` - Amount of collateral being deposited
+///
+/// # Returns
+/// * `Some(lp_tokens)` - LP tokens to mint (rounds DOWN — pool-favoring)
+/// * `None` - Arithmetic overflow
+///
+/// # Invariant
+/// First depositor (supply == 0): gets 1:1 LP tokens.
+/// Subsequent: `lp = amount * (supply + VIRTUAL_SHARES) / (pool_value + VIRTUAL_ASSETS)`
+/// (pro-rata with N7 virtual-offset, rounded down).
+pub fn calc_lp_for_deposit(
+    total_lp_supply: u64,
+    total_pool_value: u64,
+    deposit_amount: u64,
+) -> Option<u64> {
+    if total_lp_supply == 0 && total_pool_value == 0 {
+        // True first depositor — 1:1. (With the virtual offset applied uniformly,
+        // this equals (deposit * VIRTUAL_SHARES) / VIRTUAL_ASSETS = deposit exactly,
+        // since VIRTUAL_SHARES == VIRTUAL_ASSETS; kept as an explicit branch for
+        // clarity and to avoid a redundant division on the hot bootstrap path.)
+        Some(deposit_amount)
+    } else if total_lp_supply == 0 {
+        // CRITICAL: LP supply is 0 but pool has orphaned value (e.g., returned insurance
+        // after all LP holders withdrew). Allowing 1:1 deposits here would let the
+        // depositor withdraw the entire orphaned value. Block deposits.
+        None
+    } else if total_pool_value == 0 {
+        // LP tokens exist but pool value is 0 (fully flushed to insurance).
+        // Existing holders have a claim on future insurance returns.
+        // Allowing deposits would dilute that claim. Block deposits.
+        None
+    } else {
+        // Pro-rata via u128 to prevent overflow. N7: +VIRTUAL_SHARES / +VIRTUAL_ASSETS
+        // on both sides of the ratio (see const doc above).
+        let lp = (deposit_amount as u128)
+            .checked_mul((total_lp_supply as u128).checked_add(VIRTUAL_SHARES)?)?
+            .checked_div((total_pool_value as u128).checked_add(VIRTUAL_ASSETS)?)?;
+        if lp > u64::MAX as u128 {
+            None
+        } else {
+            Some(lp as u64)
+        }
+    }
+}
+
+/// Calculate collateral for an LP token burn.
+///
+/// # Arguments
+/// * `total_lp_supply` - Current total LP tokens
+/// * `total_pool_value` - Current pool value
+/// * `lp_amount` - LP tokens being burned
+///
+/// # Returns
+/// * `Some(collateral)` - Collateral to return (rounds DOWN — pool-favoring)
+/// * `None` - Division by zero or overflow
+///
+/// # Invariant
+/// `collateral = lp_amount * (pool_value + VIRTUAL_ASSETS) / (lp_supply + VIRTUAL_SHARES)`
+/// (N7 virtual-offset, rounded down). Full burn returns ≤ pool_value (never more) —
+/// strictly less with the offset applied, since a fraction of the ratio is
+/// permanently attributed to the unowned virtual share.
+pub fn calc_collateral_for_withdraw(
+    total_lp_supply: u64,
+    total_pool_value: u64,
+    lp_amount: u64,
+) -> Option<u64> {
+    if total_lp_supply == 0 {
+        return None;
+    }
+    // N7: +VIRTUAL_ASSETS / +VIRTUAL_SHARES on both sides, symmetric with
+    // calc_lp_for_deposit above so minting and redeeming use the same offset ratio
+    // (asymmetric offsets would leak value in one direction).
+    let collateral = (lp_amount as u128)
+        .checked_mul((total_pool_value as u128).checked_add(VIRTUAL_ASSETS)?)?
+        .checked_div((total_lp_supply as u128).checked_add(VIRTUAL_SHARES)?)?;
+    if collateral > u64::MAX as u128 {
+        None
+    } else {
+        Some(collateral as u64)
+    }
+}
+
+/// Calculate pool value from accounting state.
+///
+/// # Returns
+/// * `Some(value)` if deposited + fees >= withdrawn
+/// * `None` if accounting is broken (withdrawn > deposited + fees)
+pub fn pool_value(total_deposited: u64, total_withdrawn: u64) -> Option<u64> {
+    total_deposited.checked_sub(total_withdrawn)
+}
+
+/// Calculate pool value including accrued trading fees (PERC-272).
+///
+/// # Returns
+/// * `Some(value)` if deposited + fees >= withdrawn
+/// * `None` if accounting overflow or underflow
+pub fn pool_value_with_fees(
+    total_deposited: u64,
+    total_withdrawn: u64,
+    total_fees_earned: u64,
+) -> Option<u64> {
+    total_deposited
+        .checked_sub(total_withdrawn)?
+        .checked_add(total_fees_earned)
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PERC-303: Senior/Junior LP Tranche Math
+// ═══════════════════════════════════════════════════════════════
+
+/// Calculate LP tokens for a junior tranche deposit.
+///
+/// Junior tranche has its own sub-pool: junior_balance / junior_total_lp.
+/// First junior depositor gets 1:1, subsequent get pro-rata within junior pool.
+///
+/// # Returns
+/// * `Some(lp_tokens)` to mint
+/// * `None` on overflow or blocked state (orphaned value)
+pub fn calc_junior_lp_for_deposit(
+    junior_total_lp: u64,
+    junior_balance: u64,
+    deposit_amount: u64,
+) -> Option<u64> {
+    calc_lp_for_deposit(junior_total_lp, junior_balance, deposit_amount)
+}
+
+/// Calculate LP tokens for a senior tranche deposit.
+///
+/// The senior tranche has its own sub-pool: `senior_balance / senior_total_lp`,
+/// where `senior_balance = total_pool_value - effective_junior_balance` and
+/// `senior_total_lp = total_lp_supply - junior_total_lp`.
+///
+/// This MUST price against the same basis the senior WITHDRAW path values against
+/// (`calc_senior_collateral_for_withdraw`), so a senior deposit-then-withdraw
+/// round-trip cannot profit. Pricing senior deposits at the GLOBAL ratio while
+/// redeeming at the senior ratio lets a depositor mint cheap and redeem dear after
+/// a junior-absorbed loss, extracting value from existing senior LPs. Delegates to
+/// `calc_lp_for_deposit`, inheriting its round-DOWN (pool-favoring) semantics AND
+/// its first-depositor / orphaned-value (C9) handling: a true first senior deposit
+/// (`senior_total_lp == 0 && senior_balance == 0` — empty pool, or junior-first
+/// where junior captures 100% of fees) mints 1:1, while ORPHANED senior value
+/// (`senior_total_lp == 0 && senior_balance > 0`, e.g. insurance returned after all
+/// senior LP exited) returns `None` so the caller REJECTS the deposit. Minting 1:1
+/// against an orphan would let a dust deposit redeem the whole orphaned balance, so
+/// the caller MUST NOT special-case `senior_total_lp == 0` into an unconditional
+/// 1:1 bootstrap — it defers to this guard, exactly as the non-tranche path does.
+///
+/// # Returns
+/// * `Some(lp_tokens)` to mint (rounds DOWN — pool-favoring, same as junior/global)
+/// * `None` on overflow or blocked state (orphaned value)
+pub fn calc_senior_lp_for_deposit(
+    senior_total_lp: u64,
+    senior_balance: u64,
+    deposit_amount: u64,
+) -> Option<u64> {
+    calc_lp_for_deposit(senior_total_lp, senior_balance, deposit_amount)
+}
+
+/// Calculate collateral for a junior LP token burn.
+///
+/// Junior withdrawals are valued against the junior sub-pool only.
+/// If junior_balance has been reduced by losses, junior LPs take the hit.
+///
+/// # Returns
+/// * `Some(collateral)` to return (rounds down)
+/// * `None` on overflow
+pub fn calc_junior_collateral_for_withdraw(
+    junior_total_lp: u64,
+    junior_balance: u64,
+    lp_amount: u64,
+) -> Option<u64> {
+    calc_collateral_for_withdraw(junior_total_lp, junior_balance, lp_amount)
+}
+
+/// Calculate collateral for a senior LP token burn.
+///
+/// Senior withdrawals are valued against the senior sub-pool only.
+/// senior_balance = total_pool_value - junior_balance.
+/// senior_total_lp = total_lp_supply - junior_total_lp.
+///
+/// Senior LPs only lose if junior_balance is fully wiped (== 0).
+///
+/// # Returns
+/// * `Some(collateral)` to return (rounds down)
+/// * `None` on overflow or zero senior supply
+pub fn calc_senior_collateral_for_withdraw(
+    senior_total_lp: u64,
+    senior_balance: u64,
+    lp_amount: u64,
+) -> Option<u64> {
+    calc_collateral_for_withdraw(senior_total_lp, senior_balance, lp_amount)
+}
+
+/// Distribute a loss across tranches. Junior absorbs first.
+///
+/// # Returns
+/// (junior_loss, senior_loss)
+/// Invariant: junior_loss + senior_loss == loss_amount (unless capped at total).
+pub fn distribute_loss(junior_balance: u64, senior_balance: u64, loss_amount: u64) -> (u64, u64) {
+    let total = junior_balance.saturating_add(senior_balance);
+    let capped_loss = loss_amount.min(total);
+
+    if capped_loss <= junior_balance {
+        // Junior absorbs all
+        (capped_loss, 0)
+    } else {
+        // Junior wiped, remainder hits senior
+        let senior_loss = capped_loss.saturating_sub(junior_balance);
+        (junior_balance, senior_loss)
+    }
+}
+
+/// Distribute fee income across tranches using junior multiplier.
+///
+/// Junior gets: fee * (junior_share * junior_mult_bps / 10_000) / weighted_total
+/// Senior gets: remainder
+///
+/// # Arguments
+/// * `junior_balance` - Junior tranche balance
+/// * `senior_balance` - Senior tranche balance
+/// * `junior_fee_mult_bps` - Junior fee multiplier (20000 = 2x)
+/// * `total_fee` - Total fee to distribute
+///
+/// # Returns
+/// (junior_fee, senior_fee) — guaranteed to sum to <= total_fee
+pub fn distribute_fees(
+    junior_balance: u64,
+    senior_balance: u64,
+    junior_fee_mult_bps: u16,
+    total_fee: u64,
+) -> (u64, u64) {
+    if total_fee == 0 {
+        return (0, 0);
+    }
+    let total_balance = junior_balance as u128 + senior_balance as u128;
+    if total_balance == 0 {
+        return (0, 0);
+    }
+
+    // Weighted shares: junior weight = junior_balance * mult, senior weight = senior_balance * 10_000
+    let junior_weight = (junior_balance as u128) * (junior_fee_mult_bps as u128);
+    let senior_weight = (senior_balance as u128) * 10_000u128;
+    let total_weight = junior_weight + senior_weight;
+
+    if total_weight == 0 {
+        return (0, 0);
+    }
+
+    // `total_fee as u128` is at most 2^64.
+    // `junior_weight` is at most u64::MAX * 50_000 ≈ 2^80 (junior_fee_mult_bps capped at 50_000).
+    // Their product can reach 2^144 which overflows u128 (max 2^128).
+    //
+    // FINDING-7: The previous >>24 shift fallback introduced a ratio error because shifting
+    // both numerator weight and denominator weight by the same amount is only exact when the
+    // shift divides both evenly — otherwise truncation of the low bits creates a systematic
+    // bias. Use exact integer arithmetic instead:
+    //
+    //   junior_fee = total_fee / total_weight * junior_weight
+    //              + (total_fee % total_weight) * junior_weight / total_weight
+    //
+    // This identity is exact for integer division and never overflows because:
+    //   - `total_fee / total_weight` is at most total_fee (≤ 2^64)
+    //   - `(total_fee % total_weight)` < total_weight, so the second term's product is
+    //     at most (total_weight - 1) * junior_weight < total_weight * total_weight ≤ 2^160
+    //     — which still overflows if we use u128 naively for the remainder term.
+    //
+    // Simplest safe approach that fits in u128:
+    //   Divide junior_weight by gcd(junior_weight, total_weight) first, then multiply.
+    //   After reduction junior_weight_reduced ≤ total_weight_reduced, and
+    //   total_fee * junior_weight_reduced ≤ 2^64 * 2^128 — still too big.
+    //
+    // The correct approach: split total_fee into quotient and remainder relative to
+    // total_weight, then handle each part separately. Both parts fit in u128.
+    let junior_fee_u128 = if let Some(product) = (total_fee as u128).checked_mul(junior_weight) {
+        product / total_weight
+    } else {
+        // Exact two-part formula — no ratio error, no overflow:
+        //   floor(total_fee * junior_weight / total_weight)
+        //   = (total_fee / total_weight) * junior_weight
+        //   + (total_fee % total_weight) * junior_weight / total_weight
+        //
+        // Part 1: (total_fee / total_weight) * junior_weight
+        //   total_fee / total_weight ≤ total_fee ≤ u64::MAX → fits u128, product fits u128.
+        // Part 2: (total_fee % total_weight) * junior_weight / total_weight
+        //   total_fee % total_weight < total_weight ≤ junior_weight + senior_weight
+        //   junior_weight ≤ u64::MAX * 50_000 < 2^80
+        //   product < total_weight * junior_weight ≤ (2^81) * (2^80) = 2^161 → overflows u128.
+        //
+        // Handle part 2 by reducing junior_weight / total_weight to lowest terms first.
+        // After dividing by gcd, the reduced denominator fits u128 multiplication safely
+        // only if the gcd is large. As a guaranteed safe fallback when the product still
+        // won't fit (very unlikely in practice), clamp to total_fee.
+        let q = (total_fee as u128) / total_weight;
+        let r = (total_fee as u128) % total_weight;
+        let part1 = q * junior_weight; // q ≤ 2^64, junior_weight ≤ 2^80 → fits u128
+                                       // part2 = floor(r * junior_weight / total_weight). r < total_weight ≤ ~2^81 and
+                                       // junior_weight ≤ ~2^80, so r * junior_weight (~2^161) overflows u128. The previous
+                                       // `unwrap_or(total_fee)` fallback on that overflow handed junior 100% of the fee
+                                       // (0% to the protected senior tranche) — see #120. Use an exact, overflow-safe
+                                       // 256-bit mul-div instead. The true result is < junior_weight ≤ ~2^80, so it fits.
+        let part2 = mul_div_floor(r, junior_weight, total_weight);
+        part1.saturating_add(part2)
+    };
+    // Clamp to total_fee (should always hold since junior_weight <= total_weight)
+    let junior_fee = junior_fee_u128.min(total_fee as u128) as u64;
+    let senior_fee = total_fee.saturating_sub(junior_fee); // remainder to senior
+
+    (junior_fee, senior_fee)
+}
+
+/// Exact `floor(a * b / d)` for u128 operands, overflow-safe even when `a * b`
+/// exceeds u128. Requires `d != 0` and the true quotient to fit in u128 (callers
+/// guarantee this: here `b <= d`, so the quotient is `<= a`). Used by
+/// `distribute_fees` so the fee split is correct at extreme balances/fee values
+/// where the naive `a * b` overflows (#120).
+fn mul_div_floor(a: u128, b: u128, d: u128) -> u128 {
+    // Fast path: the product fits in u128.
+    if let Some(p) = a.checked_mul(b) {
+        return p / d;
+    }
+    // Slow path: form the full 256-bit product a*b = hi*2^128 + lo via 64-bit limbs,
+    // then long-divide (hi:lo) by d bit by bit.
+    let mask = u64::MAX as u128;
+    let (a0, a1) = (a & mask, a >> 64);
+    let (b0, b1) = (b & mask, b >> 64);
+    let m0 = a0 * b0; // each < 2^128
+    let m1 = a0 * b1;
+    let m2 = a1 * b0;
+    let m3 = a1 * b1;
+    // mid = m1 + m2 (the cross terms), tracking the carry bit that overflows u128.
+    let (mid, mid_carry) = {
+        let (s, c) = m1.overflowing_add(m2);
+        (s, c as u128)
+    };
+    // lo = m0 + (mid_low << 64); carry + mid_high + mid_carry + m3 go to hi.
+    let (lo, c1) = m0.overflowing_add(mid << 64);
+    let hi = m3 + (mid >> 64) + (mid_carry << 64) + (c1 as u128);
+    // Long division of (hi:lo) by d. The quotient fits u128 because the true result
+    // is <= a; bits at positions >= 128 are therefore always 0.
+    let mut rem: u128 = 0;
+    let mut quo: u128 = 0;
+    let mut i: u32 = 256;
+    while i > 0 {
+        i -= 1;
+        let bit = if i >= 128 {
+            (hi >> (i - 128)) & 1
+        } else {
+            (lo >> i) & 1
+        };
+        let rem_top = rem >> 127; // bit shifted out of the 128-bit rem below
+        rem = (rem << 1) | bit;
+        // Compare the true remainder (rem_top:rem) against d; reduce if >=.
+        if rem_top == 1 || rem >= d {
+            rem = rem.wrapping_sub(d);
+            if i < 128 {
+                quo |= 1u128 << i;
+            }
+        }
+    }
+    quo
+}
+
+/// Check senior never loses while junior is positive.
+///
+/// Given initial senior balance and post-loss senior balance,
+/// returns true if senior is protected (no loss while junior > 0).
+pub fn senior_protected(junior_balance: u64, _senior_balance: u64, loss_amount: u64) -> bool {
+    // If loss <= junior_balance, senior takes zero loss
+    loss_amount <= junior_balance
+}
+
+// ═══════════════════════════════════════════════════════════════
+// PERC-313: High-Water Mark Protection Math
+// ═══════════════════════════════════════════════════════════════
+
+/// PERC-313: Calculate the high-water mark floor value.
+///
+/// `floor = epoch_high_water_tvl * hwm_floor_bps / 10_000`
+///
+/// Returns `Some(floor)` or `None` on overflow.
+/// Uses u128 intermediate to prevent overflow for large TVL values.
+pub fn hwm_floor(epoch_high_water_tvl: u64, hwm_floor_bps: u16) -> Option<u64> {
+    let floor = (epoch_high_water_tvl as u128)
+        .checked_mul(hwm_floor_bps as u128)?
+        .checked_div(10_000)?;
+    if floor > u64::MAX as u128 {
+        None
+    } else {
+        Some(floor as u64)
+    }
+}
+
+/// PERC-313: Check whether a withdrawal is allowed under HWM protection.
+///
+/// Returns `true` if the withdrawal is allowed (post-withdrawal TVL >= floor).
+/// Returns `false` if it would push TVL below the HWM floor.
+pub fn hwm_withdrawal_allowed(
+    post_withdrawal_tvl: u64,
+    epoch_high_water_tvl: u64,
+    hwm_floor_bps: u16,
+) -> bool {
+    match hwm_floor(epoch_high_water_tvl, hwm_floor_bps) {
+        Some(floor) => post_withdrawal_tvl >= floor,
+        None => false, // overflow → conservative deny
+    }
+}
+
+// #200: `flush_available()` removed. It was dead code (no production callers) and
+// buggy (omitted total_returned + used saturating arithmetic that could mask an
+// accounting error). The live FlushToInsurance path computes available capacity via
+// StakePool::total_pool_value() (i128-widened, total_returned- and
+// realized_junior_loss-aware) — see process_flush_to_insurance / #202.
+
+/// #290 — mode-0 fee attribution (pure; used by `processor::accrue_fees_inner`).
+///
+/// Inputs: the vault `surplus` over `total_pool_value()`, the wrapper's cumulative
+/// tag-87 payout counter `wrapper_paid`, and the pool's attribution `cursor` plus
+/// its `armed` flag. Returns `(cursor', attributable)`: the cursor to store
+/// (always armed afterwards) and the amount of surplus that may be booked as fees.
+/// The caller advances `cursor'` by whatever it actually books (at most
+/// `attributable`).
+///
+/// - Armed: `attributable = min(surplus, wrapper_paid - cursor)`, and the cursor is
+///   unchanged. The subtraction saturates, so a counter below the cursor attributes
+///   nothing.
+/// - Un-armed (pool created before #290; the cursor bytes hold a stale snapshot):
+///   the cursor is re-based to `wrapper_paid - min(surplus, wrapper_paid)`. The
+///   first accrual therefore books what the legacy code would have booked, capped
+///   at the wrapper's lifetime payouts.
+///
+/// `None` only if a re-based cursor does not fit in u64. That needs more than
+/// u64::MAX atoms of lifetime payouts, which is unreachable for an SPL token.
+pub fn mode0_attributable_fees(
+    surplus: u64,
+    wrapper_paid: u128,
+    cursor: u64,
+    armed: bool,
+) -> Option<(u64, u64)> {
+    let cursor = if armed {
+        cursor
+    } else {
+        let credit_now = (surplus as u128).min(wrapper_paid);
+        u64::try_from(wrapper_paid - credit_now).ok()?
+    };
+    let unbooked = wrapper_paid.saturating_sub(cursor as u128);
+    // min(surplus, unbooked) <= surplus <= u64::MAX, so the narrowing is lossless.
+    let attributable = (surplus as u128).min(unbooked) as u64;
+    Some((cursor, attributable))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── #290 mode-0 fee attribution ──
+
+    #[test]
+    fn test_290_armed_books_only_unbooked_wrapper_payouts() {
+        // Donation only: counter == cursor, so nothing is attributable.
+        assert_eq!(
+            mode0_attributable_fees(100_000_000, 5_000, 5_000, true),
+            Some((5_000, 0))
+        );
+        // Payout of 7_777 on top of a 100M donation: exactly the payout.
+        assert_eq!(
+            mode0_attributable_fees(100_007_777, 12_777, 5_000, true),
+            Some((5_000, 7_777))
+        );
+        // Surplus smaller than unbooked (not all payouts in the vault yet).
+        assert_eq!(mode0_attributable_fees(10, 1_000, 0, true), Some((0, 10)));
+        // Counter below cursor attributes nothing (saturating).
+        assert_eq!(mode0_attributable_fees(10, 5, 9, true), Some((9, 0)));
+    }
+
+    #[test]
+    fn test_290_unarmed_rebases_stale_snapshot() {
+        // Legacy pool: stale snapshot ignored; books min(surplus, paid) once.
+        assert_eq!(
+            mode0_attributable_fees(5_000, 5_000, 987_654_321, false),
+            Some((0, 5_000))
+        );
+        assert_eq!(
+            mode0_attributable_fees(9_000, 5_000, 1, false),
+            Some((0, 5_000))
+        );
+        assert_eq!(
+            mode0_attributable_fees(2_000, 5_000, 1, false),
+            Some((3_000, 2_000))
+        );
+        // Fresh pool before any payout: donation credits nothing.
+        assert_eq!(
+            mode0_attributable_fees(1_000_000, 0, 0, false),
+            Some((0, 0))
+        );
+        // Unreachable u64 overflow of a re-based cursor fails closed.
+        assert_eq!(
+            mode0_attributable_fees(0, u64::MAX as u128 + 1, 0, false),
+            None
+        );
+    }
+
+    // ── Basic Behavior ──
+
+    #[test]
+    fn test_first_depositor() {
+        assert_eq!(calc_lp_for_deposit(0, 0, 1_000_000), Some(1_000_000));
+    }
+
+    #[test]
+    fn test_pro_rata() {
+        assert_eq!(
+            calc_lp_for_deposit(1_000_000, 1_000_000, 500_000),
+            Some(500_000)
+        );
+    }
+
+    #[test]
+    fn test_withdraw_proportional() {
+        assert_eq!(
+            calc_collateral_for_withdraw(2_000_000, 2_000_000, 1_000_000),
+            Some(1_000_000)
+        );
+    }
+
+    #[test]
+    fn test_rounding_down() {
+        assert_eq!(calc_lp_for_deposit(999_999, 1_000_000, 1), Some(0));
+    }
+
+    #[test]
+    fn test_zero_supply_withdraw_none() {
+        assert_eq!(calc_collateral_for_withdraw(0, 100, 10), None);
+    }
+
+    // ── Conservation ──
+
+    #[test]
+    fn test_roundtrip_no_profit() {
+        // Deposit 1000 into pool with 5000 supply / 10000 value
+        let lp = calc_lp_for_deposit(5_000, 10_000, 1_000).unwrap();
+        assert_eq!(lp, 500); // 1000 * (5000+1) / (10000+1) = 500.05 -> 500 (offset negligible here)
+
+        // Withdraw those LP tokens from updated pool. N7: the VIRTUAL_SHARES/
+        // VIRTUAL_ASSETS=1 offset makes this round pool-favoring by exactly 1 unit
+        // versus the pre-N7 exact 2:1 roundtrip (500 * (11000+1)/(5500+1) = 999.99..
+        // -> floor 999, not 1000) — the offset's entire purpose is to make every
+        // withdrawal retain an epsilon in the pool rather than return it exactly,
+        // which is what defeats the donation/inflation attack. Not a profit either
+        // way (999 <= 1000 deposited), just slightly more conservative than before.
+        let back = calc_collateral_for_withdraw(5_500, 11_000, 500).unwrap();
+        assert_eq!(back, 999);
+        assert!(
+            back <= 1_000,
+            "N7 offset must never let a withdrawal profit"
+        );
+    }
+
+    #[test]
+    fn test_roundtrip_with_rounding_loss() {
+        // Deposit 7 into pool with 3 supply / 10 value → lp = 7*3/10 = 2
+        let lp = calc_lp_for_deposit(3, 10, 7).unwrap();
+        assert_eq!(lp, 2);
+
+        // Withdraw 2 LP from pool (5 supply, 17 value) → col = 2*17/5 = 6
+        let back = calc_collateral_for_withdraw(5, 17, 2).unwrap();
+        assert_eq!(back, 6);
+        assert!(back <= 7); // Can't profit
+    }
+
+    #[test]
+    fn test_two_depositors_conservation() {
+        // A deposits 100 (first depositor, 1:1)
+        let a_lp = calc_lp_for_deposit(0, 0, 100).unwrap();
+        assert_eq!(a_lp, 100);
+
+        // B deposits 50
+        let b_lp = calc_lp_for_deposit(100, 100, 50).unwrap();
+        assert_eq!(b_lp, 50);
+
+        // A withdraws
+        let a_back = calc_collateral_for_withdraw(150, 150, 100).unwrap();
+        assert_eq!(a_back, 100);
+
+        // B withdraws from remaining
+        let b_back = calc_collateral_for_withdraw(50, 50, 50).unwrap();
+        assert_eq!(b_back, 50);
+
+        assert!(a_back + b_back <= 100 + 50);
+    }
+
+    // ── Dilution Protection ──
+
+    #[test]
+    fn test_no_dilution_attack() {
+        // A deposits 1000 (1:1)
+        let a_lp = calc_lp_for_deposit(0, 0, 1000).unwrap();
+
+        // A's value before B
+        let a_value_before = calc_collateral_for_withdraw(a_lp, 1000, a_lp).unwrap();
+        assert_eq!(a_value_before, 1000);
+
+        // B deposits 1 (tiny amount)
+        let b_lp = calc_lp_for_deposit(1000, 1000, 1).unwrap();
+        assert_eq!(b_lp, 1); // floor(1*1000/1000) = 1
+
+        // A's value after B deposits
+        let a_value_after = calc_collateral_for_withdraw(1001, 1001, 1000).unwrap();
+        assert!(a_value_after >= a_value_before); // A not diluted
+    }
+
+    // ── Edge Cases ──
+
+    #[test]
+    fn test_zero_deposit_zero_lp() {
+        assert_eq!(calc_lp_for_deposit(100, 200, 0), Some(0));
+    }
+
+    #[test]
+    fn test_zero_burn_zero_col() {
+        assert_eq!(calc_collateral_for_withdraw(100, 200, 0), Some(0));
+    }
+
+    #[test]
+    fn test_deposit_into_zero_value_pool_blocked() {
+        // Supply > 0 but value = 0 → blocked (C9 fix: protects existing holders'
+        // claim on future insurance returns from dilution)
+        assert_eq!(calc_lp_for_deposit(100, 0, 50), None);
+    }
+
+    #[test]
+    fn test_deposit_orphaned_value_blocked() {
+        // Supply = 0 but value > 0 → blocked (C9 fix: prevents theft of
+        // orphaned insurance returns by first new depositor)
+        assert_eq!(calc_lp_for_deposit(0, 500, 1), None);
+    }
+
+    #[test]
+    fn test_large_values_no_overflow() {
+        let max = u64::MAX / 2;
+        // Should handle via u128 intermediates
+        assert!(calc_lp_for_deposit(max, max, max).is_some());
+        assert!(calc_collateral_for_withdraw(max, max, max).is_some());
+    }
+
+    #[test]
+    fn test_u64_max_deposit() {
+        // All three are u64::MAX → pro-rata path (supply > 0, value > 0)
+        // u64::MAX as u128 * u64::MAX as u128 = (2^64-1)^2 = 2^128 - 2^65 + 1
+        // u128::MAX = 2^128 - 1, so it fits. Result = u64::MAX.
+        let result = calc_lp_for_deposit(u64::MAX, u64::MAX, u64::MAX);
+        assert_eq!(result, Some(u64::MAX));
+    }
+
+    // ── Pool Value ──
+
+    #[test]
+    fn test_pool_value_normal() {
+        assert_eq!(pool_value(1000, 300), Some(700));
+    }
+
+    #[test]
+    fn test_pool_value_overdrawn() {
+        assert_eq!(pool_value(100, 200), None);
+    }
+
+    #[test]
+    fn test_pool_value_exact() {
+        assert_eq!(pool_value(100, 100), Some(0));
+    }
+
+    // ── Rounding Direction ──
+
+    #[test]
+    fn test_lp_rounds_down_not_up() {
+        // deposit=7, supply=3, pool_value=10 → 7*3/10 = 2.1 → should be 2
+        let lp = calc_lp_for_deposit(3, 10, 7).unwrap();
+        assert_eq!(lp, 2);
+        // Verify: lp * pv <= dep * supply (pool-favoring)
+        assert!((lp as u128) * 10 <= (7u128) * 3);
+    }
+
+    #[test]
+    fn test_withdrawal_rounds_down_not_up() {
+        // lp=3, supply=7, pool_value=10 → 3*10/7 = 4.28 → should be 4
+        let col = calc_collateral_for_withdraw(7, 10, 3).unwrap();
+        assert_eq!(col, 4);
+        // Verify: col * supply <= lp * pv (pool-favoring)
+        assert!((col as u128) * 7 <= (3u128) * 10);
+    }
+
+    // ── C9 Attack Scenarios ──
+
+    #[test]
+    fn test_c9_orphaned_insurance_theft_blocked() {
+        // Scenario: All LP holders withdrew, then insurance returned to vault.
+        // pool_value > 0, LP_supply = 0. Attacker deposits 1 token.
+        // OLD behavior: attacker gets 1 LP (1:1), then withdraws entire pool_value.
+        // NEW behavior: None — deposits blocked when orphaned value exists.
+        assert_eq!(calc_lp_for_deposit(0, 10_000_000, 1), None);
+    }
+
+    #[test]
+    fn test_c9_dilution_attack_blocked() {
+        // Scenario: Pool fully flushed (value=0), LP holders still have tokens.
+        // New depositor at 1:1 would dilute existing holders' insurance claims.
+        // Blocked: pool_value == 0 with supply > 0.
+        assert_eq!(calc_lp_for_deposit(1000, 0, 500), None);
+    }
+
+    #[test]
+    fn test_c9_true_first_depositor_works() {
+        // True first deposit: both supply and value are 0. 1:1 ratio.
+        assert_eq!(calc_lp_for_deposit(0, 0, 1000), Some(1000));
+    }
+
+    #[test]
+    fn test_c9_normal_pro_rata_unaffected() {
+        // Normal state: supply > 0, value > 0. Pro-rata works as before.
+        assert_eq!(calc_lp_for_deposit(1000, 2000, 500), Some(250));
+    }
+
+    // ── Monotonicity ──
+
+    #[test]
+    fn test_larger_deposit_more_lp() {
+        let small = calc_lp_for_deposit(100, 200, 10).unwrap();
+        let large = calc_lp_for_deposit(100, 200, 20).unwrap();
+        assert!(large >= small);
+    }
+
+    #[test]
+    fn test_larger_burn_more_collateral() {
+        let small = calc_collateral_for_withdraw(100, 200, 10).unwrap();
+        let large = calc_collateral_for_withdraw(100, 200, 20).unwrap();
+        assert!(large >= small);
+    }
+
+    // ── PERC-272: Fee-inclusive Pool Value ──
+
+    #[test]
+    fn test_pool_value_with_fees() {
+        assert_eq!(pool_value_with_fees(1000, 200, 100), Some(900));
+    }
+
+    #[test]
+    fn test_pool_value_with_fees_zero() {
+        assert_eq!(pool_value_with_fees(1000, 1000, 0), Some(0));
+    }
+
+    #[test]
+    fn test_pool_value_with_fees_overflow() {
+        assert_eq!(pool_value_with_fees(100, 200, 50), None);
+    }
+
+    // ── PERC-303: Tranche Tests ──
+
+    #[test]
+    fn test_junior_first_deposit_1_to_1() {
+        assert_eq!(calc_junior_lp_for_deposit(0, 0, 1000), Some(1000));
+    }
+
+    #[test]
+    fn test_junior_pro_rata() {
+        assert_eq!(calc_junior_lp_for_deposit(1000, 2000, 500), Some(250));
+    }
+
+    #[test]
+    fn test_senior_first_deposit_1_to_1() {
+        // True first senior depositor (empty senior sub-pool) → 1:1.
+        assert_eq!(calc_senior_lp_for_deposit(0, 0, 1000), Some(1000));
+    }
+
+    #[test]
+    fn test_senior_pro_rata() {
+        // Senior sub-pool worth 2x → half the LP per token (rounds down, pool-favoring).
+        assert_eq!(calc_senior_lp_for_deposit(1000, 2000, 500), Some(250));
+    }
+
+    #[test]
+    fn test_senior_deposit_orphaned_value_blocked() {
+        // Senior LP supply 0 but senior balance > 0 (orphaned value): the math
+        // helper blocks (the caller `process_deposit` handles the legitimate
+        // first-senior bootstrap via its `senior_total_lp() == 0` branch).
+        assert_eq!(calc_senior_lp_for_deposit(0, 500, 1000), None);
+    }
+
+    #[test]
+    fn test_senior_deposit_round_trip_no_profit_after_loss() {
+        // Deposit then immediate withdraw on the senior sub-pool must not profit.
+        // Senior sub-pool after a junior-absorbed loss: senior_total_lp=1000, senior_balance=1000.
+        let lp = calc_senior_lp_for_deposit(1000, 1000, 1000).unwrap(); // 1000 LP
+                                                                        // After deposit, senior_total_lp=2000, senior_balance=2000.
+        let back = calc_senior_collateral_for_withdraw(2000, 2000, lp).unwrap();
+        assert!(
+            back <= 1000,
+            "senior round-trip must not profit (got {back})"
+        );
+    }
+
+    #[test]
+    fn test_junior_withdraw_proportional() {
+        // N7: 500*(2000+1)/(1000+1) = 999.500... -> floor 999 (was exact 1000 pre-offset).
+        assert_eq!(
+            calc_junior_collateral_for_withdraw(1000, 2000, 500),
+            Some(999)
+        );
+    }
+
+    #[test]
+    fn test_junior_withdraw_after_loss() {
+        assert_eq!(
+            calc_junior_collateral_for_withdraw(1000, 500, 1000),
+            Some(500)
+        );
+    }
+
+    #[test]
+    fn test_senior_withdraw_full_protection() {
+        // N7: 500*(1000+1)/(500+1) = 999.001... -> floor 999 (was exact 1000 pre-offset).
+        assert_eq!(
+            calc_senior_collateral_for_withdraw(500, 1000, 500),
+            Some(999)
+        );
+    }
+
+    #[test]
+    fn test_distribute_loss_junior_absorbs_all() {
+        let (j, s) = distribute_loss(1000, 5000, 800);
+        assert_eq!(j, 800);
+        assert_eq!(s, 0);
+    }
+
+    #[test]
+    fn test_distribute_loss_junior_wiped() {
+        let (j, s) = distribute_loss(1000, 5000, 1500);
+        assert_eq!(j, 1000);
+        assert_eq!(s, 500);
+    }
+
+    #[test]
+    fn test_distribute_loss_total_wipe() {
+        let (j, s) = distribute_loss(1000, 5000, 10000);
+        assert_eq!(j, 1000);
+        assert_eq!(s, 5000);
+    }
+
+    #[test]
+    fn test_distribute_loss_zero() {
+        let (j, s) = distribute_loss(1000, 5000, 0);
+        assert_eq!(j, 0);
+        assert_eq!(s, 0);
+    }
+
+    #[test]
+    fn test_distribute_fees_2x_multiplier() {
+        let (jf, sf) = distribute_fees(1000, 4000, 20000, 600);
+        assert_eq!(jf, 200);
+        assert_eq!(sf, 400);
+    }
+
+    #[test]
+    fn test_distribute_fees_no_junior() {
+        let (jf, sf) = distribute_fees(0, 5000, 20000, 1000);
+        assert_eq!(jf, 0);
+        assert_eq!(sf, 1000);
+    }
+
+    #[test]
+    fn test_distribute_fees_no_senior() {
+        let (jf, sf) = distribute_fees(5000, 0, 20000, 1000);
+        assert_eq!(jf, 1000);
+        assert_eq!(sf, 0);
+    }
+
+    #[test]
+    fn test_distribute_fees_zero_fee() {
+        let (jf, sf) = distribute_fees(1000, 4000, 20000, 0);
+        assert_eq!(jf, 0);
+        assert_eq!(sf, 0);
+    }
+
+    // #120: at extreme balances/fee the inner `r * junior_weight` overflows u128.
+    // The old fallback handed junior 100%; these assert the exact proportional split.
+    // Expected values computed with arbitrary-precision integers (junior = floor(
+    // total_fee * junior_weight / total_weight), senior = total_fee - junior).
+    #[test]
+    fn test_distribute_fees_overflow_proportional() {
+        let max = u64::MAX;
+        // Symmetric, 5x junior mult → junior weight 50000, senior 10000 → 5/6 vs 1/6.
+        let (jf, sf) = distribute_fees(max, max, 50000, max);
+        assert_eq!(jf, 15372286728091293012);
+        assert_eq!(sf, 3074457345618258603);
+        assert_eq!((jf as u128) + (sf as u128), max as u128); // conservation
+        assert!(sf > 0, "#120: protected senior must not be zeroed out");
+
+        // Junior-heavy.
+        let (jf, sf) = distribute_fees(max, 1_000_000, 50000, max);
+        assert_eq!(jf, 18446744073709351615);
+        assert_eq!(sf, 200000);
+
+        // Senior-heavy.
+        let (jf, sf) = distribute_fees(1_000_000, max, 50000, max);
+        assert_eq!(jf, 4999999);
+        assert_eq!(sf, 18446744073704551616);
+
+        // Mid-range values that still overflow the naive product.
+        let (jf, sf) = distribute_fees(max / 2, max / 3, 30000, max / 7);
+        assert_eq!(jf, 2156112943680337201);
+        assert_eq!(sf, 479136209706741601);
+    }
+
+    #[test]
+    fn test_mul_div_floor_matches_native_when_product_fits() {
+        // Fast-path agreement with the native computation across a range of values.
+        for &(a, b, d) in &[
+            (1_000_000u128, 500_000u128, 1_500_000u128),
+            (0, 123, 7),
+            (u64::MAX as u128, 3, 7),
+            (12345678, 87654321, 999983),
+            (1, 1, 1),
+        ] {
+            assert_eq!(mul_div_floor(a, b, d), (a * b) / d);
+        }
+        // Slow-path (a*b overflows u128) sanity: floor(2^120 * 2^120 / 2^120) == 2^120.
+        let big = 1u128 << 120;
+        assert_eq!(mul_div_floor(big, big, big), big);
+    }
+
+    #[test]
+    fn test_senior_protected_when_junior_covers() {
+        assert!(senior_protected(1000, 5000, 800));
+    }
+
+    #[test]
+    fn test_senior_not_protected_when_loss_exceeds_junior() {
+        assert!(!senior_protected(1000, 5000, 1500));
+    }
+
+    // ── PERC-313: HWM Floor ──
+
+    #[test]
+    fn test_hwm_floor_basic() {
+        assert_eq!(hwm_floor(1000, 5000), Some(500));
+    }
+
+    #[test]
+    fn test_hwm_floor_zero_tvl() {
+        assert_eq!(hwm_floor(0, 5000), Some(0));
+    }
+
+    #[test]
+    fn test_hwm_floor_zero_bps() {
+        assert_eq!(hwm_floor(1000, 0), Some(0));
+    }
+
+    #[test]
+    fn test_hwm_floor_100_percent() {
+        assert_eq!(hwm_floor(1000, 10_000), Some(1000));
+    }
+
+    #[test]
+    fn test_hwm_floor_rounds_down() {
+        assert_eq!(hwm_floor(999, 5000), Some(499));
+    }
+
+    #[test]
+    fn test_hwm_floor_large_values() {
+        let result = hwm_floor(u64::MAX, 5000);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), u64::MAX / 2);
+    }
+
+    #[test]
+    fn test_hwm_withdrawal_allowed_above_floor() {
+        assert!(hwm_withdrawal_allowed(600, 1000, 5000));
+    }
+
+    #[test]
+    fn test_hwm_withdrawal_allowed_at_floor() {
+        assert!(hwm_withdrawal_allowed(500, 1000, 5000));
+    }
+
+    #[test]
+    fn test_hwm_withdrawal_blocked_below_floor() {
+        assert!(!hwm_withdrawal_allowed(499, 1000, 5000));
+    }
+
+    #[test]
+    fn test_hwm_withdrawal_allowed_zero_floor() {
+        assert!(hwm_withdrawal_allowed(0, 1000, 0));
+    }
+
+    #[test]
+    fn test_hwm_withdrawal_blocked_100_percent_floor() {
+        assert!(!hwm_withdrawal_allowed(999, 1000, 10_000));
+        assert!(hwm_withdrawal_allowed(1000, 1000, 10_000));
+    }
+
+    #[test]
+    fn test_fee_appreciation_increases_share_price() {
+        let lp_before = calc_collateral_for_withdraw(1000, 1000, 100).unwrap();
+        assert_eq!(lp_before, 100); // supply == value -> offset cancels exactly
+                                    // N7: 100*(1200+1)/(1000+1) = 119.98... -> floor 119 (was exact 120 pre-offset).
+        let lp_after = calc_collateral_for_withdraw(1000, 1200, 100).unwrap();
+        assert_eq!(lp_after, 119);
+        assert!(
+            lp_after > lp_before,
+            "fee appreciation must still raise share price"
+        );
+    }
+
+    // ── N7 (CONSOLIDATED-PLAN §2.2): virtual-offset mutation checks ─────────
+    //
+    // These assert the offset formula produces a DIFFERENT (strictly more
+    // conservative) result than the pre-N7 exact formula whenever supply != value
+    // — i.e. that VIRTUAL_SHARES/VIRTUAL_ASSETS are actually wired into the
+    // arithmetic, not silently zeroed out or dead code. If a future edit
+    // regresses the offset back to 0 (equivalent to removing it), these fail.
+
+    /// Reimplementation of the PRE-N7 exact (no-offset) formula, used only as a
+    /// mutation-check baseline in this test module — never call this in production.
+    fn pre_n7_calc_lp_for_deposit_baseline(
+        total_lp_supply: u64,
+        total_pool_value: u64,
+        deposit_amount: u64,
+    ) -> Option<u64> {
+        if total_lp_supply == 0 && total_pool_value == 0 {
+            Some(deposit_amount)
+        } else if total_lp_supply == 0 || total_pool_value == 0 {
+            None
+        } else {
+            let lp = (deposit_amount as u128)
+                .checked_mul(total_lp_supply as u128)?
+                .checked_div(total_pool_value as u128)?;
+            (lp <= u64::MAX as u128).then_some(lp as u64)
+        }
+    }
+
+    fn pre_n7_calc_collateral_for_withdraw_baseline(
+        total_lp_supply: u64,
+        total_pool_value: u64,
+        lp_amount: u64,
+    ) -> Option<u64> {
+        if total_lp_supply == 0 {
+            return None;
+        }
+        let col = (lp_amount as u128)
+            .checked_mul(total_pool_value as u128)?
+            .checked_div(total_lp_supply as u128)?;
+        (col <= u64::MAX as u128).then_some(col as u64)
+    }
+
+    #[test]
+    fn n7_mutation_check_deposit_offset_diverges_from_pre_n7_baseline() {
+        // supply != value -> the offset must change the result (pool-favoring,
+        // i.e. <= the pre-N7 baseline). If this ever becomes an EQUALITY, the
+        // offset has been silently removed/zeroed — that's the regression this
+        // test exists to catch.
+        let (supply, value, deposit) = (900_000u64, 400_000u64, 400_000u64);
+        let pre_n7 = pre_n7_calc_lp_for_deposit_baseline(supply, value, deposit).unwrap();
+        let current = calc_lp_for_deposit(supply, value, deposit).unwrap();
+        assert!(
+            current < pre_n7,
+            "N7 REGRESSION: calc_lp_for_deposit({supply},{value},{deposit}) = {current} must be \
+             STRICTLY LESS than the pre-N7 baseline {pre_n7} — equality means the virtual \
+             offset was removed"
+        );
+        assert!(
+            current > 0,
+            "sanity: this deposit must still mint something"
+        );
+    }
+
+    #[test]
+    fn n7_mutation_check_withdraw_offset_diverges_from_pre_n7_baseline() {
+        let (supply, value, lp) = (1_000u64, 2_000u64, 500u64);
+        let pre_n7 = pre_n7_calc_collateral_for_withdraw_baseline(supply, value, lp).unwrap();
+        let current = calc_collateral_for_withdraw(supply, value, lp).unwrap();
+        assert!(
+            current < pre_n7,
+            "N7 REGRESSION: calc_collateral_for_withdraw({supply},{value},{lp}) = {current} must \
+             be STRICTLY LESS than the pre-N7 baseline {pre_n7} — equality means the virtual \
+             offset was removed"
+        );
+    }
+
+    #[test]
+    fn n7_mutation_check_zero_offset_would_reproduce_exact_pre_n7_values_on_full_test_suite() {
+        // Direct proof that VIRTUAL_SHARES/VIRTUAL_ASSETS are the ONLY delta between
+        // the two formulas: with supply == value (offset cancels identically for any
+        // nonzero offset magnitude), current and pre-N7 baseline must match exactly —
+        // proving the divergence seen in the tests above comes from the offset, not
+        // from an unrelated formula change.
+        let current = calc_lp_for_deposit(500_000, 500_000, 250_000).unwrap();
+        let pre_n7 = pre_n7_calc_lp_for_deposit_baseline(500_000, 500_000, 250_000).unwrap();
+        assert_eq!(
+            current, pre_n7,
+            "supply==value must cancel the offset exactly"
+        );
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Kani Formal Verification
+// ═══════════════════════════════════════════════════════════════
+//
+// Production-type (u64/u128) proofs live in kani-proofs/ crate with
+// u32/u64 mirrors for CBMC tractability. See kani-proofs/src/lib.rs.
+//
+// Keeping this note here so nobody adds u64 Kani proofs that timeout.
+
+// (PERC-272 tests moved to mod tests above)
