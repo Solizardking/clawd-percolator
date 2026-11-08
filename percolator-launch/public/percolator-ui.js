@@ -56,7 +56,9 @@
   }
   async function markets() {
     try {
-      var r = await (await fetch('/api/markets', { cache: 'no-store' })).json();
+      var response = await fetch('/api/markets', { cache: 'no-store' });
+      var r = await response.json();
+      if (!response.ok || r.error) throw new Error(r.error || 'Market service unavailable');
       var rows = (r.markets || []).map(function (m) {
         return '<tr><td><b>' + esc(m.name) + '</b>' + (m.symbol ? ' <span class="sub">' + esc(m.symbol) + '</span>' : '') + '</td>'
           + '<td class="mono"><a target="_blank" rel="noopener" href="' + EXPLORER + '/address/' + esc(m.creator) + '">' + esc(short(m.creator)) + '</a></td>'
@@ -68,7 +70,7 @@
       $('markets').innerHTML = rows.join('') || '<tr><td colspan="6" class="sub">No markets yet. Launch the first one.</td></tr>';
       perpList((r.markets || []).filter(function (m) { return m.tradable; }));
       $('market-count').textContent = (r.markets || []).length;
-    } catch (e) { $('markets').innerHTML = '<tr><td colspan="5" class="sub">Market list unavailable.</td></tr>'; }
+    } catch (e) { $('market-count').textContent = 'unavailable'; $('markets').innerHTML = '<tr><td colspan="6" class="sub">Market list unavailable. Retry shortly; this does not mean zero markets.</td></tr>'; }
   }
   // ── Trading ──
   var perp = '';
