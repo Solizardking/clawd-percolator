@@ -3,8 +3,6 @@
  * test/launch-clawd.test.js asserts these equal deploy/clawd-percolator.json.
  */
 
-const SOLANA_OR_HELIUS = /api\.devnet\.solana\.com|api\.mainnet-beta\.solana\.com|helius-rpc\.com/;
-
 const CLAWD_RPC = "https://rpc.clawdchain.trade";
 
 const CLAWD_PROGRAMS = {
@@ -34,18 +32,30 @@ function isClawdDeployment(env = process.env) {
  * rejected. Otherwise the manifest gateway is used.
  * @param {NodeJS.ProcessEnv} [env]
  */
-function resolveClawdRpc(env = process.env) {
-  const override = env.CLAWD_PUBLIC_RPC || env.NEXT_PUBLIC_CLAWD_RPC || env.CLAWD_RPC;
-  if (override) {
-    if (SOLANA_OR_HELIUS.test(override)) {
-      throw new Error("CLAWD_RPC must not target a Solana public or Helius endpoint");
-    }
-    return override;
+function validateClawdRpc(value, internal = false) {
+  let url;
+  try { url = new URL(value); } catch { throw new Error("Invalid CLAWD RPC URL"); }
+  const publicGateway = url.hostname === "rpc.clawdchain.trade" && url.protocol === "https:" && !url.port;
+  const localValidator = internal && ["validator", "localhost", "127.0.0.1", "[::1]"].includes(url.hostname)
+    && ["http:", "https:"].includes(url.protocol);
+  if ((!publicGateway && !localValidator) || url.username || url.password || url.hash) {
+    throw new Error("CLAWD RPC must use the Clawd test gateway or an internal validator");
   }
-  return CLAWD_RPC;
+  return url.href;
+}
+
+function resolveClawdRpc(env = process.env) {
+  // Internal container addresses must never be sent to the browser.
+  return validateClawdRpc(env.CLAWD_PUBLIC_RPC || env.NEXT_PUBLIC_CLAWD_RPC || CLAWD_RPC);
+}
+
+function resolveClawdServerRpc(env = process.env) {
+  return validateClawdRpc(env.CLAWD_RPC || "http://validator:8080", true);
 }
 
 module.exports = {
+  validateClawdRpc,
+  resolveClawdServerRpc,
   CLAWD_RPC,
   CLAWD_PROGRAMS,
   isClawdDeployment,

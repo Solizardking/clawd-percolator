@@ -3,9 +3,9 @@ const { loadClawdCluster } = require("../../lib/clawd-cluster.js");
 const h = React.createElement;
 
 function WalletPanel() {
-  return h("div", { className: "card", "data-surface": "wallet" },
+  return h("div", { className: "card", id: "wallet", "data-surface": "wallet" },
     h("h3", { style: { marginTop: 0 } }, "Browser wallet"),
-    h("p", { className: "sub" }, "A clawd chain keypair kept in this browser. Import your clawd wallet phrase to use the same address."),
+    h("p", { className: "sub" }, "Test wallet stored in this browser. Use a dedicated test phrase; never import a wallet holding real funds."),
     h("div", { className: "kv" },
       h("div", null, "Address"), h("div", { className: "mono", id: "wallet-address" }, "…"),
       h("div", null, "Balance"), h("div", { id: "wallet-balance" }, "…")),
@@ -18,7 +18,7 @@ function WalletPanel() {
 
 function MarketLaunch(props) {
   const cluster = props.cluster;
-  return h("section", { className: "card", "data-surface": "market-launch" },
+  return h("section", { className: "card", id: "launch", "data-surface": "market-launch" },
     h("h2", { style: { marginTop: 0 } }, "Market launch"),
     h("form", { "data-action": "create-market" },
       h("label", { htmlFor: "clawd-market-name" }, "Market name"),
@@ -32,7 +32,7 @@ function MarketLaunch(props) {
 }
 
 function MarketList() {
-  return h("section", { className: "card", "data-surface": "markets", style: { marginTop: 18 } },
+  return h("section", { className: "card", id: "browse", "data-surface": "markets", style: { marginTop: 18 } },
     h("h2", { style: { marginTop: 0 } }, "Launched markets ", h("span", { className: "pill ok", id: "market-count" }, "…")),
     h("div", { style: { overflowX: "auto" } },
       h("table", null,
@@ -42,9 +42,9 @@ function MarketList() {
 
 function btn(id, label, action, hot) { return h("button", { type: "button", className: hot ? "btn hot" : "btn", id, "data-action": action }, label); }
 function TradePanel({ cluster }) {
-  return h("section", { className: "card", "data-surface": "trade" },
-    h("h3", { style: { marginTop: 0 } }, "Trade ", h("span", { className: "pill ok", id: "trade-status" }, "live")),
-    h("p", { className: "sub" }, "Trade against the clawd wrapper. Collateral is test cUSD; the house LP takes the other side at the mark price."),
+  return h("section", { className: "card", id: "trade", "data-surface": "trade" },
+    h("h3", { style: { marginTop: 0 } }, "Trade ", h("span", { className: "pill ok", id: "trade-status" }, "test network")),
+    h("p", { className: "sub" }, "Trade against the clawd wrapper. Collateral is test cUSD; the house LP takes the other side at a fixed initial price. No live oracle is connected."),
     h("label", { htmlFor: "perp-market" }, "Market"),
     h("select", { id: "perp-market" }, h("option", { value: "" }, "Loading…")),
     h("div", { className: "kv", style: { marginTop: 12 } },
@@ -62,9 +62,9 @@ function TradePanel({ cluster }) {
     h("p", { className: "sub mono", "data-program": "wrapper" }, cluster.programs.wrapper));
 }
 function InsuranceStake({ cluster }) {
-  return h("section", { className: "card", "data-surface": "insurance-stake" },
+  return h("section", { className: "card", id: "earn", "data-surface": "insurance-stake" },
     h("h3", { style: { marginTop: 0 } }, "Insurance stake"),
-    h("p", { className: "sub" }, "Stake cUSD into the market's insurance pool and receive LP tokens."),
+    h("p", { className: "sub" }, "Stake test cUSD into the market insurance pool and receive test LP tokens. No real-money yield or guaranteed coverage."),
     h("div", { className: "kv" }, h("div", null, "Staked LP"), h("div", { id: "pos-lp" }, "–")),
     h("label", { htmlFor: "amt-stake" }, "Amount (cUSD)"),
     h("input", { id: "amt-stake", defaultValue: "100", inputMode: "decimal" }),
@@ -82,12 +82,35 @@ function PositionNft({ cluster }) {
 function ClawdChainApp(props) {
   const cluster = props && props.cluster ? props.cluster : loadClawdCluster();
   return h("main", { className: "wrap", "data-network": "clawd", "data-rpc": cluster.rpc, "data-wrapper": cluster.programs.wrapper },
-    h("h1", { style: { fontSize: 42, lineHeight: 1.05, margin: "0 0 8px" } }, "Percolator"),
-    h("p", { className: "sub", style: { marginTop: 0 } }, "Launch perpetual markets on the clawd chain. Every launch is an on-chain transaction you can inspect in the explorer."),
+    h("div", { className: "test-banner", role: "note" }, "CLAWD CHAIN TESTNET · NOT REAL MONEY · Break things. Report bugs. Don’t trust, verify."),
+    h("header", { className: "hero" },
+      h("span", { className: "pill" }, "CLAWD / PERCOLATOR"),
+      h("h1", null, "Your market. Your test ground."),
+      h("p", { className: "sub" }, "Launch and trade experimental perpetual markets on our own Clawd Chain. Test CLAWD pays network fees. Test cUSD is collateral. Neither represents real money."),
+      h("nav", { className: "jump-nav", "aria-label": "Percolator sections" },
+        h("a", { className: "btn hot", href: "#launch" }, "Launch a market"),
+        h("a", { className: "btn", href: "#browse" }, "Browse markets"),
+        h("a", { className: "btn", href: "#trade" }, "Trade"),
+        h("a", { className: "btn", href: "#earn" }, "Insurance pools"),
+        h("a", { className: "btn", href: "#wallet" }, "Test wallet")),
+      h("p", { className: "sub" }, "Current build: fixed initial prices · house-managed market admin and LP · no live APY or volume claims · mainnet is not enabled.")),
+    h("section", { className: "card", "aria-label": "How it works" },
+      h("h2", null, "Three steps to your test market"),
+      h("ol", null,
+        h("li", null, "Create a dedicated test wallet and request faucet CLAWD."),
+        h("li", null, "Name your market. Submit its registry transaction, then provision trading."),
+        h("li", null, "Request test cUSD, open an account, and explore trades, insurance staking, and position NFTs.")),
+      h("p", { className: "sub" }, "Provisioning depends on validator confirmation and server configuration. Insurance is a loss buffer, not a solvency guarantee.")),
     h("div", { className: "grid g2", style: { alignItems: "start" } }, h(MarketLaunch, { cluster }), h(WalletPanel)),
     h(MarketList),
     h("p", { id: "trade-notice", style: { minHeight: "1.4em", color: "var(--cy)", wordBreak: "break-all" } }),
-    h("div", { className: "grid g4", style: { marginTop: 8, alignItems: "start" } }, h(TradePanel, { cluster }), h(InsuranceStake, { cluster }), h(PositionNft, { cluster })));
+    h("div", { className: "grid g4", style: { marginTop: 8, alignItems: "start" } }, h(TradePanel, { cluster }), h(InsuranceStake, { cluster }), h(PositionNft, { cluster })),
+    h("footer", { className: "card", style: { marginTop: 24 } },
+      h("h2", null, "Don’t trust, verify."),
+      h("p", null, "Our wrapper, insurance stake, and position NFT addresses are shown above. Verify transactions in the Clawd explorer. Admin and upgrade authorities have not been burned."),
+      h("a", { href: "https://github.com/Solizardking/clawd-percolator/issues/new" }, "Report a bug"), " · ",
+      h("a", { href: "https://github.com/dcccrypto/percolator-launch" }, "Launcher foundation"), " · ",
+      h("a", { href: "https://github.com/aeyakovenko/percolator" }, "Risk engine research")));
 }
 
 module.exports = { ClawdChainApp, MarketLaunch, MarketList, WalletPanel, TradePanel, InsuranceStake, PositionNft };

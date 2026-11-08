@@ -27,12 +27,14 @@ const P = require(path.join(publicDir, "percolator.js"));
 const port = Number(process.env.PORT || 8080);
 const HIDDEN = new Set(String(process.env.PERCOLATOR_HIDDEN_LAUNCHES || "").split(",").map((x) => x.trim()).filter(Boolean));
 const cluster = require(path.join(path.dirname(componentPath), "../../lib/clawd-cluster.js")).loadClawdCluster();
+const { resolveClawdServerRpc } = require(path.join(path.dirname(componentPath), "../../lib/clawd-ids.js"));
+const VALIDATOR = resolveClawdServerRpc();
 let trading = null;
 try {
-  trading = require("./perc-api.js").init({ rpc: process.env.CLAWD_RPC || "http://validator:8080", dataDir: process.env.PERCOLATOR_DATA || "/data",
+  trading = require("./perc-api.js").init({ rpc: VALIDATOR, dataDir: process.env.PERCOLATOR_DATA || "/data",
     programs: cluster.programs, registry: P.REGISTRY, parseMemo: P.parseMemo, hidden: HIDDEN });
 } catch (e) { console.error("trading disabled:", e.message); }
-const VALIDATOR = process.env.CLAWD_RPC || "http://validator:8080";
+
 const EXPLORER = process.env.CLAWD_EXPLORER || "https://explorer.clawdchain.trade";
 const FAUCET = process.env.CLAWD_FAUCET || "https://faucet.clawdchain.trade";
 
@@ -46,6 +48,7 @@ const PAGE_CSS = 'label{display:block;color:var(--dim);font-size:12px;font-weigh
   + '.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}#notice{min-height:1.4em;margin:12px 0 0;color:var(--cy);word-break:break-all}'
   + '.kv{grid-template-columns:90px 1fr}.btn[disabled]{opacity:.45;cursor:not-allowed}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:8px 10px;border-bottom:1px solid var(--line);white-space:nowrap}th{color:var(--dim);font-size:12px}'
   + 'select{background:#0b0a15;border:1px solid var(--line);border-radius:12px;color:var(--txt);padding:12px 14px;font:inherit;width:100%}'
+  + '.test-banner{padding:12px;border:1px solid var(--cy);border-radius:12px;color:var(--cy);margin-bottom:24px}.hero{padding:28px 0}.hero h1{font-size:clamp(38px,7vw,76px);line-height:1.05;margin:14px 0}.hero p{max-width:680px}.jump-nav{display:flex;flex-wrap:wrap;gap:12px;margin:24px 0}section{scroll-margin-top:24px}.mono{overflow-wrap:anywhere}.g4{grid-template-columns:repeat(auto-fit,minmax(min(100%,280px),1fr))}'
   + '@media(max-width:860px){.g2{grid-template-columns:1fr}}';
 
 function page() {
