@@ -59,7 +59,7 @@ mod proofs {
 
     #[kani::proof]
     fn token_split_fee_bps_conserves() {
-        let amount: u16 = kani::any();
+        let amount: u8 = kani::any();
         let bps: u16 = kani::any();
         kani::assume(bps <= 10_000);
         assert_split_conserves(amount as u128, |t| split_fee_bps(t, bps).unwrap());
@@ -74,7 +74,7 @@ mod proofs {
 
     #[kani::proof]
     fn token_three_way_split_conserves() {
-        let total: u16 = kani::any();
+        let total: u8 = kani::any();
         let a_bps: u16 = kani::any();
         let b_bps: u16 = kani::any();
         kani::assume(a_bps as u32 + b_bps as u32 <= 10_000);

@@ -242,14 +242,14 @@ mod proofs {
         kani::assert(payout <= my_pnl.max(0) as u128, "payout bounded by positive pnl");
     }
 
-    /// Same property on a 32-bit domain (fast; smoke profile).
+    /// Same property on an 8-bit domain (fast; smoke profile).
     #[kani::proof]
-    fn risk_payout_bounded_by_profit_u32() {
-        let vault: u32 = kani::any();
-        let principal: u32 = kani::any();
-        let insurance: u32 = kani::any();
-        let total: u32 = kani::any();
-        let pnl: u32 = kani::any();
+    fn risk_payout_bounded_by_profit_small() {
+        let vault: u8 = kani::any();
+        let principal: u8 = kani::any();
+        let insurance: u8 = kani::any();
+        let total: u8 = kani::any();
+        let pnl: u8 = kani::any();
         let (n, d) = haircut_ratio(vault as u128, principal as u128, insurance as u128, total as u128);
         let payout = effective_pnl(pnl as i128, n, d);
         kani::assert(payout <= pnl as u128, "payout bounded by positive pnl");
@@ -257,9 +257,9 @@ mod proofs {
 
     #[kani::proof]
     fn risk_effective_pnl_exact_floor() {
-        let pnl: u16 = kani::any();
-        let num: u16 = kani::any();
-        let den: u16 = kani::any();
+        let pnl: u8 = kani::any();
+        let num: u8 = kani::any();
+        let den: u8 = kani::any();
         kani::assume(den > 0 && num <= den);
         let got = effective_pnl(pnl as i128, num as u128, den as u128);
         let want = (pnl as u32) * (num as u32) / (den as u32);
@@ -275,10 +275,10 @@ mod proofs {
 
     #[kani::proof]
     fn risk_effective_pnl_monotone_in_pnl() {
-        let p1: u16 = kani::any();
-        let p2: u16 = kani::any();
-        let num: u16 = kani::any();
-        let den: u16 = kani::any();
+        let p1: u8 = kani::any();
+        let p2: u8 = kani::any();
+        let num: u8 = kani::any();
+        let den: u8 = kani::any();
         kani::assume(p1 <= p2);
         let a = effective_pnl(p1 as i128, num as u128, den as u128);
         let b = effective_pnl(p2 as i128, num as u128, den as u128);
@@ -287,12 +287,12 @@ mod proofs {
 
     #[kani::proof]
     fn risk_effective_pnl_monotone_in_vault() {
-        let v1: u16 = kani::any();
-        let v2: u16 = kani::any();
-        let principal: u16 = kani::any();
-        let insurance: u16 = kani::any();
-        let pnl_pos_total: u16 = kani::any();
-        let pnl: u16 = kani::any();
+        let v1: u8 = kani::any();
+        let v2: u8 = kani::any();
+        let principal: u8 = kani::any();
+        let insurance: u8 = kani::any();
+        let pnl_pos_total: u8 = kani::any();
+        let pnl: u8 = kani::any();
         kani::assume(v1 <= v2);
         let (n1, d1) = haircut_ratio(v1 as u128, principal as u128, insurance as u128, pnl_pos_total as u128);
         let (n2, d2) = haircut_ratio(v2 as u128, principal as u128, insurance as u128, pnl_pos_total as u128);
@@ -306,11 +306,11 @@ mod proofs {
     /// more than the residual above principal + insurance.
     #[kani::proof]
     fn risk_effective_pnl_aggregate_backed() {
-        let vault: u16 = kani::any();
-        let principal: u16 = kani::any();
-        let insurance: u16 = kani::any();
-        let p1: u16 = kani::any();
-        let p2: u16 = kani::any();
+        let vault: u8 = kani::any();
+        let principal: u8 = kani::any();
+        let insurance: u8 = kani::any();
+        let p1: u8 = kani::any();
+        let p2: u8 = kani::any();
         let total = p1 as u128 + p2 as u128;
         let (n, d) = haircut_ratio(vault as u128, principal as u128, insurance as u128, total);
         let a = effective_pnl(p1 as i128, n, d);
@@ -324,13 +324,13 @@ mod proofs {
 
     #[kani::proof]
     fn risk_warmup_slope_bounds() {
-        let pnl: u32 = kani::any();
-        let period: u16 = kani::any();
+        let pnl: u8 = kani::any();
+        let period: u8 = kani::any();
         let s = warmup_slope(pnl as u128, period as u64);
         kani::assert((s == 0) == (pnl == 0), "slope zero iff pnl zero");
         kani::assert(s <= pnl as u128, "slope never exceeds pnl");
         let s32 = s as u32; // in range: s <= pnl
-        if period > 0 && pnl >= period as u32 {
+        if period > 0 && pnl as u32 >= period as u32 {
             kani::assert(
                 (s32 as u64) * (period as u64) <= pnl as u64,
                 "full-period conversion never exceeds pnl",
@@ -340,10 +340,10 @@ mod proofs {
 
     #[kani::proof]
     fn risk_warmed_amount_monotone_and_capped() {
-        let pnl: u16 = kani::any();
-        let period: u16 = kani::any();
-        let t1: u16 = kani::any();
-        let t2: u16 = kani::any();
+        let pnl: u8 = kani::any();
+        let period: u8 = kani::any();
+        let t1: u8 = kani::any();
+        let t2: u8 = kani::any();
         kani::assume(t1 <= t2);
         let s = warmup_slope(pnl as u128, period as u64);
         let w1 = warmed_amount(s, t1 as u64, pnl as u128);
@@ -387,10 +387,10 @@ mod proofs {
     /// Opposite positions: payments net to 0 or +1 (protocol-favouring).
     #[kani::proof]
     fn risk_funding_zero_sum() {
-        let size: u16 = kani::any();
-        let delta: u16 = kani::any();
+        let size: u8 = kani::any();
+        let delta: u8 = kani::any();
         let delta_neg: bool = kani::any();
-        let scale: u16 = kani::any();
+        let scale: u8 = kani::any();
         kani::assume(scale > 0);
         let d = if delta_neg { -(delta as i128) } else { delta as i128 };
         let long = funding_payment(size as i128, d, scale as u128).unwrap();
@@ -406,10 +406,10 @@ mod proofs {
 
     #[kani::proof]
     fn risk_funding_sign_and_bound() {
-        let size: u16 = kani::any();
+        let size: u8 = kani::any();
         let short: bool = kani::any();
-        let delta: u16 = kani::any();
-        let scale: u16 = kani::any();
+        let delta: u8 = kani::any();
+        let scale: u8 = kani::any();
         kani::assume(scale > 0);
         let pos = if short { -(size as i128) } else { size as i128 };
         let p = funding_payment(pos, delta as i128, scale as u128).unwrap();

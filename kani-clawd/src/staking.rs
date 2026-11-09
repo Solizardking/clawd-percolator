@@ -33,12 +33,13 @@ pub fn assert_reward_monotone_in_stake(
 /// `max_bps` at `max_lock` slots, flat afterwards.
 #[inline]
 pub fn linear_multiplier_bps(duration: u64, max_lock: u64, max_bps: u16) -> u128 {
-    let base = 10_000u128;
-    let top = if (max_bps as u128) > base { max_bps as u128 } else { base };
+    let top: u32 = if max_bps as u32 > 10_000 { max_bps as u32 } else { 10_000 };
     if max_lock == 0 || duration >= max_lock {
-        return top;
+        return top as u128;
     }
-    base + (top - base) * duration as u128 / max_lock as u128
+    // span < 2^16 and duration < 2^64, so the product fits in u128.
+    let span = (top - 10_000) as u128;
+    10_000 + span * duration as u128 / max_lock as u128
 }
 
 #[cfg(kani)]
@@ -71,7 +72,11 @@ mod proofs {
             kani::any::<u32>() as u64,
             kani::any::<u32>() as u64,
             kani::any::<u16>() as u64,
-            |s, d| s as u128 * linear_multiplier_bps(d, max_lock as u64, 20_000) / 10_000,
+            |s, d| {
+                let m = linear_multiplier_bps(d, max_lock as u64, 20_000);
+                crate::check!(m <= 20_000, "multiplier in range");
+                (s as u64 * m as u16 as u64 / 10_000) as u128
+            },
         );
     }
 }

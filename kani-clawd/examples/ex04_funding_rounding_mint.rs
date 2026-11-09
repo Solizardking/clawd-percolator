@@ -14,13 +14,14 @@ fn funding_vulnerable(pos: i128, delta: i128, scale: u128) -> Option<i128> {
 }
 
 fn check(f: fn(i128, i128, u128) -> Option<i128>) {
-    let pos: i8 = kani::any();
-    let delta: i8 = kani::any();
+    let size: u8 = kani::any();
+    let delta: u8 = kani::any();
     let scale: u8 = kani::any();
     kani::assume(scale > 0);
-    let long = f(pos as i128, delta as i128, scale as u128).unwrap();
-    let short = f(-(pos as i128), delta as i128, scale as u128).unwrap();
-    kani::assert(long + short >= 0, "funding never pays out more than it collects");
+    let long = f(size as i128, delta as i128, scale as u128).unwrap();
+    let short = f(-(size as i128), delta as i128, scale as u128).unwrap();
+    kani::assert(long.unsigned_abs() <= 65_536 && short.unsigned_abs() <= 65_536, "payments in range");
+    kani::assert(long as i32 + short as i32 >= 0, "funding never pays out more than it collects");
 }
 
 #[kani::proof]

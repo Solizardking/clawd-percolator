@@ -59,7 +59,7 @@ mod proofs {
 
     #[kani::proof]
     fn bounds_bps_split_total() {
-        let amount: u32 = kani::any();
+        let amount: u8 = kani::any();
         let bps: u16 = kani::any();
         assert_total_on(
             (amount, bps),

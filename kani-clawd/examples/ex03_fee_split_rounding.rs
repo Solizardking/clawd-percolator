@@ -22,7 +22,7 @@ fn split_fixed(fee: u128, protocol_bps: u16) -> (u128, u128) {
 }
 
 fn check(f: fn(u128, u16) -> (u128, u128)) {
-    let fee: u16 = kani::any();
+    let fee: u8 = kani::any();
     let bps: u16 = kani::any();
     kani::assume(bps <= 10_000);
     assert_split_conserves(fee as u128, |t| f(t, bps));

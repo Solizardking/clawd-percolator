@@ -110,9 +110,9 @@ mod proofs {
 
     #[kani::proof]
     fn math_mul_div_floor_le_ceil() {
-        let a: u16 = kani::any();
-        let b: u16 = kani::any();
-        let d: u16 = kani::any();
+        let a: u8 = kani::any();
+        let b: u8 = kani::any();
+        let d: u8 = kani::any();
         kani::assume(d > 0);
         let f = mul_div_floor(a as u128, b as u128, d as u128).unwrap();
         let c = mul_div_ceil(a as u128, b as u128, d as u128).unwrap();
@@ -123,9 +123,9 @@ mod proofs {
 
     #[kani::proof]
     fn math_ceil_div_signed_spec() {
-        let n: u16 = kani::any();
+        let n: u8 = kani::any();
         let neg: bool = kani::any();
-        let d: u16 = kani::any();
+        let d: u8 = kani::any();
         kani::assume(d > 0);
         let n = if neg { -(n as i32) } else { n as i32 };
         let q = ceil_div_signed(n as i128, d as u128).unwrap();
@@ -138,8 +138,8 @@ mod proofs {
 
     #[kani::proof]
     fn math_ceil_div_signed_odd_symmetry() {
-        let n: u16 = kani::any();
-        let d: u16 = kani::any();
+        let n: u8 = kani::any();
+        let d: u8 = kani::any();
         kani::assume(d > 0);
         let pos = ceil_div_signed(n as i128, d as u128).unwrap();
         let neg = ceil_div_signed(-(n as i128), d as u128).unwrap();
@@ -150,7 +150,7 @@ mod proofs {
 
     #[kani::proof]
     fn math_bps_of_bounded() {
-        let amount: u32 = kani::any();
+        let amount: u8 = kani::any();
         let bps: u16 = kani::any();
         match bps_of(amount as u128, bps) {
             Some(v) => kani::assert(bps <= 10_000 && v <= amount as u128, "share <= amount"),

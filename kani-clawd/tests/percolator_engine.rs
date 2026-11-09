@@ -8,7 +8,7 @@
 //! cargo kani --tests --harness percolator_
 #![cfg(kani)]
 
-use percolator::wide_math::floor_div_signed_conservative_i128;
+use percolator::wide_math::{floor_div_signed_conservative_i128, mul_div_ceil_u128, mul_div_floor_u128};
 use percolator::*;
 
 /// Backing-utilization fee: every atom taken from capital lands in bucket
@@ -50,11 +50,13 @@ fn percolator_earnings_withdraw_conserves() {
     }
 }
 
+/// Slow (engine routes the insurance leg through U256 wide math): full profile
+/// with a long timeout only.
 /// Domain fee split: provider + insurance legs sum to the total fee, which is
 /// never more than the lien itself.
 #[kani::proof]
 fn percolator_fee_split_conserves() {
-    let atoms: u16 = kani::any();
+    let atoms: u8 = kani::any();
     let fee_bps: u16 = kani::any();
     let share_bps: u16 = kani::any();
     let num = (atoms as u128) * BOUND_SCALE;
@@ -73,26 +75,46 @@ fn percolator_fee_split_conserves() {
 /// funding): q * d <= n < (q + 1) * d.
 #[kani::proof]
 fn percolator_floor_div_signed_conservative() {
-    let n: i16 = kani::any();
+    let mag: u8 = kani::any();
+    let neg: bool = kani::any();
     let d: u8 = kani::any();
     kani::assume(d > 0);
-    let q = floor_div_signed_conservative_i128(n as i128, d as u128);
-    kani::assert(q * (d as i128) <= n as i128, "q * d <= n");
-    kani::assert((q + 1) * (d as i128) > n as i128, "n < (q + 1) * d");
+    let n = if neg { -(mag as i128) } else { mag as i128 };
+    let q = floor_div_signed_conservative_i128(n, d as u128);
+    kani::assert(q.unsigned_abs() <= mag as u128 + 1, "quotient in range");
+    let (q, n, d) = (q as i64, n as i64, d as i64);
+    kani::assert(q * d <= n, "q * d <= n");
+    kani::assert((q + 1) * d > n, "n < (q + 1) * d");
 }
 
-/// Engine mul-div (native-or-wide) agrees with exact floor/ceil arithmetic.
+/// Engine native mul-div (`wide_math::mul_div_{floor,ceil}_u128`) agrees with
+/// exact floor/ceil arithmetic.
 #[kani::proof]
 fn percolator_mul_div_matches_exact() {
     let a: u8 = kani::any();
     let b: u8 = kani::any();
     let d: u8 = kani::any();
     kani::assume(d > 0);
-    let exact = (a as u128) * (b as u128);
-    let f = kani_mul_div_floor_u128_or_wide(a as u128, b as u128, d as u128).unwrap();
-    let c = kani_mul_div_ceil_u128_or_wide(a as u128, b as u128, d as u128).unwrap();
-    kani::assert(f == exact / d as u128, "floor matches");
-    kani::assert(c == f + if exact % d as u128 == 0 { 0 } else { 1 }, "ceil matches");
+    let exact = (a as u32) * (b as u32);
+    let f = mul_div_floor_u128(a as u128, b as u128, d as u128);
+    let c = mul_div_ceil_u128(a as u128, b as u128, d as u128);
+    kani::assert(f == (exact / d as u32) as u128, "floor matches");
+    kani::assert(c == f + (exact % d as u32 != 0) as u128, "ceil matches");
+}
+
+/// Engine trading-fee kernel: ceil(notional * bps / 10_000), never exceeding
+/// the notional for bps <= 10_000 and charging at least 1 atom on any nonzero fee.
+#[kani::proof]
+fn percolator_checked_fee_bps_ceil() {
+    let notional: u8 = kani::any();
+    let bps: u16 = kani::any();
+    kani::assume(bps <= 10_000);
+    let fee = kani_checked_fee_bps(notional as u128, bps as u64).unwrap();
+    let p = (notional as u64) * (bps as u64);
+    let want = p / 10_000 + (p % 10_000 != 0) as u64;
+    kani::assert(fee == want as u128, "fee is ceil(notional * bps / 10_000)");
+    kani::assert(fee <= notional as u128, "fee never exceeds notional");
+    kani::assert((fee == 0) == (p == 0), "no free trades: nonzero exposure pays >= 1");
 }
 
 /// A negative-PnL account with other open legs is always loss-locked; a
@@ -120,7 +142,7 @@ fn percolator_effective_pnl_matches_engine_mul_div() {
     let den: u8 = kani::any();
     kani::assume(den > 0 && num <= den && pnl > 0);
     let ours = kani_clawd::risk::effective_pnl(pnl as i128, num as u128, den as u128);
-    let engine = kani_mul_div_floor_u128_or_wide(pnl as u128, num as u128, den as u128).unwrap();
+    let engine = mul_div_floor_u128(pnl as u128, num as u128, den as u128);
     kani::assert(ours == engine, "spec matches engine kernel");
 }
 

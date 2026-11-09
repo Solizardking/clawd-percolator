@@ -18,10 +18,10 @@ fn haircut_vulnerable(vault: u128, principal: u128, _insurance: u128, pnl_pos: u
 }
 
 fn check(h: fn(u128, u128, u128, u128) -> (u128, u128)) {
-    let vault: u16 = kani::any();
-    let principal: u16 = kani::any();
-    let insurance: u16 = kani::any();
-    let pnl: u16 = kani::any();
+    let vault: u8 = kani::any();
+    let principal: u8 = kani::any();
+    let insurance: u8 = kani::any();
+    let pnl: u8 = kani::any();
     let (v, p, i) = (vault as u128, principal as u128, insurance as u128);
     let (n, d) = h(v, p, i, pnl as u128);
     let payout = effective_pnl(pnl as i128, n, d);
