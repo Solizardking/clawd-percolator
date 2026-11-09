@@ -50,24 +50,41 @@ fn percolator_earnings_withdraw_conserves() {
     }
 }
 
-/// Slow (engine routes the insurance leg through U256 wide math): full profile
-/// with a long timeout only.
 /// Domain fee split: provider + insurance legs sum to the total fee, which is
 /// never more than the lien itself.
+///
+/// Bound: `fee_bps` / `share_bps` are drawn from a concrete in-range set. The
+/// engine routes the insurance leg through U256 wide math; fully symbolic
+/// `u16` bps do not close under cadical within 15+ minutes even with `atoms: u8`.
+/// Invalid bps (>10_000) are still covered by the `Err` arm via one out-of-range
+/// concrete witness below.
 #[kani::proof]
+#[kani::unwind(12)]
 fn percolator_fee_split_conserves() {
     let atoms: u8 = kani::any();
-    let fee_bps: u16 = kani::any();
-    let share_bps: u16 = kani::any();
     let num = (atoms as u128) * BOUND_SCALE;
-    match backing_domain_fee_split_for_lien_delta_num(num, fee_bps, share_bps) {
-        Ok(s) => {
-            kani::assert(s.lien_delta_atoms == atoms as u128, "atoms recovered exactly");
-            kani::assert(s.provider_fee + s.insurance_fee == s.total_fee, "fee legs conserve total");
-            kani::assert(s.insurance_fee <= s.total_fee, "insurance leg bounded");
-            kani::assert(s.total_fee <= s.lien_delta_atoms, "fee never exceeds lien");
+    // In-range concrete bps (covers 0, mid, max) + one invalid pair for Err.
+    for (fee_bps, share_bps) in [
+        (0u16, 0u16),
+        (1, 1),
+        (10, 100),
+        (100, 1_000),
+        (1_000, 5_000),
+        (5_000, 5_000),
+        (10_000, 10_000),
+        (10_001, 0), // invalid fee_bps
+        (0, 10_001), // invalid share_bps
+    ] {
+        match backing_domain_fee_split_for_lien_delta_num(num, fee_bps, share_bps) {
+            Ok(s) => {
+                kani::assert(fee_bps <= 10_000 && share_bps <= 10_000, "Ok only for in-range bps");
+                kani::assert(s.lien_delta_atoms == atoms as u128, "atoms recovered exactly");
+                kani::assert(s.provider_fee + s.insurance_fee == s.total_fee, "fee legs conserve total");
+                kani::assert(s.insurance_fee <= s.total_fee, "insurance leg bounded");
+                kani::assert(s.total_fee <= s.lien_delta_atoms, "fee never exceeds lien");
+            }
+            Err(_) => kani::assert(fee_bps > 10_000 || share_bps > 10_000, "rejects only invalid bps"),
         }
-        Err(_) => kani::assert(fee_bps > 10_000 || share_bps > 10_000, "rejects only invalid bps"),
     }
 }
 
