@@ -262,8 +262,10 @@ mod proofs {
         let den: u8 = kani::any();
         kani::assume(den > 0 && num <= den);
         let got = effective_pnl(pnl as i128, num as u128, den as u128);
-        let want = (pnl as u32) * (num as u32) / (den as u32);
-        kani::assert(got == want as u128, "matches floor(pnl * num / den)");
+        kani::assert(got <= pnl as u128, "in range");
+        // got == floor(pnl * num / den), stated as a bracket (cheap for SAT).
+        let (g, p, n, d) = (got as u32, pnl as u32, num as u32, den as u32);
+        kani::assert(g * d <= p * n && p * n < (g + 1) * d, "matches floor(pnl * num / den)");
     }
 
     #[kani::proof]
@@ -282,6 +284,20 @@ mod proofs {
         kani::assume(p1 <= p2);
         let a = effective_pnl(p1 as i128, num as u128, den as u128);
         let b = effective_pnl(p2 as i128, num as u128, den as u128);
+        kani::assert(a <= p1 as u128 && b <= p2 as u128, "in range");
+        if den == 0 {
+            kani::assert(a == 0 && b == 0, "zero denominator pays nothing");
+            return;
+        }
+        let n = num.min(den) as u32;
+        let (a, b, d) = (a as u32, b as u32, den as u32);
+        // Lemma (checked, then assumed): both payouts are floors of pnl * n / d.
+        let lemma = a * d <= p1 as u32 * n
+            && (p1 as u32) * n < (a + 1) * d
+            && b * d <= p2 as u32 * n
+            && (p2 as u32) * n < (b + 1) * d;
+        kani::assert(lemma, "payouts are floors");
+        kani::assume(lemma);
         kani::assert(a <= b, "payout monotone in pnl");
     }
 
@@ -296,10 +312,15 @@ mod proofs {
         kani::assume(v1 <= v2);
         let (n1, d1) = haircut_ratio(v1 as u128, principal as u128, insurance as u128, pnl_pos_total as u128);
         let (n2, d2) = haircut_ratio(v2 as u128, principal as u128, insurance as u128, pnl_pos_total as u128);
-        kani::assert(
-            effective_pnl(pnl as i128, n1, d1) <= effective_pnl(pnl as i128, n2, d2),
-            "payout monotone in vault",
-        );
+        kani::assert(d1 == d2 && n1 <= n2 && n2 <= d2 && d2 <= 255, "haircut monotone, in range");
+        let a = effective_pnl(pnl as i128, n1, d1);
+        let b = effective_pnl(pnl as i128, n2, d2);
+        kani::assert(a <= pnl as u128 && b <= pnl as u128, "in range");
+        let (a, b, n1, n2, d, p) = (a as u32, b as u32, n1 as u32, n2 as u32, d1 as u32, pnl as u32);
+        let lemma = a * d <= p * n1 && p * n2 < (b + 1) * d;
+        kani::assert(lemma, "payouts are floors");
+        kani::assume(lemma);
+        kani::assert(a <= b, "payout monotone in vault");
     }
 
     /// Two claimants whose positive PnL sums to pnl_pos_total can never be paid
@@ -316,8 +337,14 @@ mod proofs {
         let a = effective_pnl(p1 as i128, n, d);
         let b = effective_pnl(p2 as i128, n, d);
         kani::assert(a <= p1 as u128 && b <= p2 as u128, "each payout <= its claim");
+        kani::assert(n <= d && d <= 510, "haircut in range");
+        let (a, b, n, d) = (a as u32, b as u32, n as u32, d as u32);
+        // Lemma (checked, then assumed): each payout is a floor of claim * n / d.
+        let lemma = a * d <= p1 as u32 * n && b * d <= p2 as u32 * n;
+        kani::assert(lemma, "payouts are floors of claim * haircut");
+        kani::assume(lemma);
         let residual = junior_residual(vault as u128, principal as u128, insurance as u128);
-        kani::assert(total == 0 || a + b <= residual, "sum of payouts <= residual");
+        kani::assert(total == 0 || (a + b) as u128 <= residual, "sum of payouts <= residual");
     }
 
     // ---------------- warmup ----------------
@@ -395,11 +422,16 @@ mod proofs {
         let d = if delta_neg { -(delta as i128) } else { delta as i128 };
         let long = funding_payment(size as i128, d, scale as u128).unwrap();
         let short = funding_payment(-(size as i128), d, scale as u128).unwrap();
-        kani::assert(long.unsigned_abs() <= u16::MAX as u128 + 1, "payment in range");
-        kani::assert(short.unsigned_abs() <= u16::MAX as u128 + 1, "payment in range");
-        let net = long as i32 + short as i32;
+        kani::assert(long.unsigned_abs() <= 65_536 && short.unsigned_abs() <= 65_536, "payment in range");
+        let (long, short, s) = (long as i64, short as i64, scale as i64);
+        let raw = (size as i64) * (if delta_neg { -(delta as i64) } else { delta as i64 });
+        // Lemma (checked, then assumed): each payment is ceil(exposure / scale).
+        let lemma = long * s >= raw && (long - 1) * s < raw && short * s >= -raw && (short - 1) * s < -raw;
+        kani::assert(lemma, "payments are ceilings");
+        kani::assume(lemma);
+        let net = long + short;
         kani::assert(net == 0 || net == 1, "funding is zero-sum up to 1 unit for the protocol");
-        if ((size as u32) * (delta as u32)) % (scale as u32) == 0 {
+        if long * s == raw {
             kani::assert(net == 0, "exactly zero-sum when divisible");
         }
     }
@@ -413,7 +445,7 @@ mod proofs {
         kani::assume(scale > 0);
         let pos = if short { -(size as i128) } else { size as i128 };
         let p = funding_payment(pos, delta as i128, scale as u128).unwrap();
-        kani::assert(p.unsigned_abs() <= u32::MAX as u128, "payment in range");
+        kani::assert(p.unsigned_abs() <= 65_536, "payment in range");
         let p = p as i64;
         let raw = if short { -((size as i64) * (delta as i64)) } else { (size as i64) * (delta as i64) };
         kani::assert(p * (scale as i64) >= raw, "payer never under-charged");

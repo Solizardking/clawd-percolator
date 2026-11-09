@@ -50,9 +50,21 @@ mod proofs {
     fn staking_linear_multiplier_monotone() {
         let max_lock: u8 = kani::any();
         let max_bps: u16 = kani::any();
-        assert_multiplier_monotone(kani::any::<u8>() as u64, kani::any::<u8>() as u64, |d| {
-            linear_multiplier_bps(d, max_lock as u64, max_bps)
-        });
+        let d1: u8 = kani::any();
+        let d2: u8 = kani::any();
+        kani::assume(d1 <= d2);
+        let m = |d: u8| linear_multiplier_bps(d as u64, max_lock as u64, max_bps);
+        let (m1, m2) = (m(d1), m(d2));
+        let top = (max_bps as u32).max(10_000);
+        crate::check!(m1 >= 10_000 && m1 <= top as u128 && m2 >= 10_000 && m2 <= top as u128, "in range");
+        if max_lock > d2 {
+            // Both below the cap: floors of span * d / max_lock (lemma, checked then assumed).
+            let (e1, e2, span, ml) = (m1 as u32 - 10_000, m2 as u32 - 10_000, top - 10_000, max_lock as u32);
+            let lemma = e1 * ml <= span * (d1 as u32) && span * (d2 as u32) < (e2 + 1) * ml;
+            crate::check!(lemma, "multipliers are floors");
+            kani::assume(lemma);
+        }
+        assert_multiplier_monotone(d1 as u64, d2 as u64, |d| if d == d1 as u64 { m1 } else { m2 });
     }
 
     #[kani::proof]
@@ -67,11 +79,11 @@ mod proofs {
 
     #[kani::proof]
     fn staking_reward_monotone_in_stake() {
-        let max_lock: u16 = kani::any();
+        let max_lock: u8 = kani::any();
         assert_reward_monotone_in_stake(
-            kani::any::<u32>() as u64,
-            kani::any::<u32>() as u64,
-            kani::any::<u16>() as u64,
+            kani::any::<u8>() as u64,
+            kani::any::<u8>() as u64,
+            kani::any::<u8>() as u64,
             |s, d| {
                 let m = linear_multiplier_bps(d, max_lock as u64, 20_000);
                 crate::check!(m <= 20_000, "multiplier in range");

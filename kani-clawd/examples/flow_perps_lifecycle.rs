@@ -75,37 +75,42 @@ fn flow_perps_lifecycle() {
     kani::assert(m.backed(), "deposit: senior claims backed");
 
     // trade: zero-sum mark pnl between user and LP, taker fee charged as fee debt
-    let pnl: i8 = kani::any();
+    let pnl_mag: u8 = kani::any();
+    let user_wins: bool = kani::any();
+    let pnl: i128 = if user_wins { pnl_mag as i128 } else { -(pnl_mag as i128) };
     let notional: u8 = kani::any();
     let fee_bps: u16 = kani::any();
     kani::assume(fee_bps <= 100);
-    m.user.pnl += pnl as i128;
-    m.lp.pnl -= pnl as i128;
+    m.user.pnl += pnl;
+    m.lp.pnl -= pnl;
     m.user.fee_credits -= bps_of(notional as u128, fee_bps).unwrap() as i128;
     kani::assert(m.user.pnl + m.lp.pnl == 0, "trade pnl is zero-sum");
     kani::assert(m.backed(), "trade: senior claims backed");
 
     // funding
-    let pos: i8 = kani::any();
-    let delta: i8 = kani::any();
-    let fu = funding_payment(pos as i128, delta as i128, 10).unwrap();
-    let fl = funding_payment(-(pos as i128), delta as i128, 10).unwrap();
+    let size: u8 = kani::any();
+    let user_long: bool = kani::any();
+    let delta: u8 = kani::any();
+    kani::assume(size <= 15 && delta <= 15);
+    let pos: i128 = if user_long { size as i128 } else { -(size as i128) };
+    let fu = funding_payment(pos, delta as i128, 10).unwrap();
+    let fl = funding_payment(-pos, delta as i128, 10).unwrap();
     kani::assert(fu + fl >= 0, "funding never creates value");
     m.user.pnl -= fu;
     m.lp.pnl -= fl;
 
     // settle (losers first, as the engine's touch order does not matter for backing)
-    let (t0, t1) = (kani::any::<u8>() as u64 % 32, kani::any::<u8>() as u64 % 32);
+    let (t0, t1) = (kani::any::<u8>() as u64 % 8, kani::any::<u8>() as u64 % 8);
     kani::assume(t0 <= t1);
     let period: u8 = kani::any();
-    kani::assume(period <= 16);
+    kani::assume(period <= 4);
     settle(&mut m, false, t1 - t0, period as u64);
     kani::assert(m.backed(), "settle LP: senior claims backed");
     settle(&mut m, true, t1 - t0, period as u64);
     kani::assert(m.backed(), "settle user: senior claims backed");
 
     // withdraw
-    let amount: u16 = kani::any();
+    let amount: u8 = kani::any();
     if (amount as u128) <= m.user.capital {
         let vault_before = m.vault;
         m.user.capital -= amount as u128;

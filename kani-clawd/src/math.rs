@@ -116,9 +116,13 @@ mod proofs {
         kani::assume(d > 0);
         let f = mul_div_floor(a as u128, b as u128, d as u128).unwrap();
         let c = mul_div_ceil(a as u128, b as u128, d as u128).unwrap();
+        // Bracket form (cheap for SAT): f*d <= a*b < (f+1)*d, c = f or f+1.
         let exact = (a as u32) * (b as u32);
-        kani::assert(f == (exact / d as u32) as u128, "floor is exact");
-        kani::assert(c == f + (exact % d as u32 != 0) as u128, "ceil = floor + (rem != 0)");
+        kani::assert(f <= exact as u128 && c <= exact as u128 + 1, "results in range");
+        let (f, c, d) = (f as u32, c as u32, d as u32);
+        kani::assert(f * d <= exact && exact < (f + 1) * d, "floor is exact");
+        kani::assert(c * d >= exact && (c == f || c == f + 1), "ceil is exact");
+        kani::assert((c == f) == (f * d == exact), "ceil = floor iff divisible");
     }
 
     #[kani::proof]

@@ -98,8 +98,10 @@ fn percolator_mul_div_matches_exact() {
     let exact = (a as u32) * (b as u32);
     let f = mul_div_floor_u128(a as u128, b as u128, d as u128);
     let c = mul_div_ceil_u128(a as u128, b as u128, d as u128);
-    kani::assert(f == (exact / d as u32) as u128, "floor matches");
-    kani::assert(c == f + (exact % d as u32 != 0) as u128, "ceil matches");
+    kani::assert(f <= exact as u128 && c <= exact as u128 + 1, "results in range");
+    let (f, c, d) = (f as u32, c as u32, d as u32);
+    kani::assert(f * d <= exact && exact < (f + 1) * d, "floor matches");
+    kani::assert(c * d >= exact && (c == f || c == f + 1) && ((c == f) == (f * d == exact)), "ceil matches");
 }
 
 /// Engine trading-fee kernel: ceil(notional * bps / 10_000), never exceeding
@@ -110,10 +112,10 @@ fn percolator_checked_fee_bps_ceil() {
     let bps: u16 = kani::any();
     kani::assume(bps <= 10_000);
     let fee = kani_checked_fee_bps(notional as u128, bps as u64).unwrap();
-    let p = (notional as u64) * (bps as u64);
-    let want = p / 10_000 + (p % 10_000 != 0) as u64;
-    kani::assert(fee == want as u128, "fee is ceil(notional * bps / 10_000)");
     kani::assert(fee <= notional as u128, "fee never exceeds notional");
+    let p = (notional as u64) * (bps as u64);
+    let f = fee as u64;
+    kani::assert(f * 10_000 >= p && (f == 0 || (f - 1) * 10_000 < p), "fee is ceil(notional * bps / 10_000)");
     kani::assert((fee == 0) == (p == 0), "no free trades: nonzero exposure pays >= 1");
 }
 
@@ -143,7 +145,12 @@ fn percolator_effective_pnl_matches_engine_mul_div() {
     kani::assume(den > 0 && num <= den && pnl > 0);
     let ours = kani_clawd::risk::effective_pnl(pnl as i128, num as u128, den as u128);
     let engine = mul_div_floor_u128(pnl as u128, num as u128, den as u128);
-    kani::assert(ours == engine, "spec matches engine kernel");
+    kani::assert(ours <= pnl as u128 && engine <= pnl as u128, "in range");
+    // Both are floor(pnl * num / den): each satisfies the same bracket, and the
+    // bracket has a unique solution, so they are equal.
+    let (o, e, p, n, d) = (ours as u32, engine as u32, pnl as u32, num as u32, den as u32);
+    kani::assert(o * d <= p * n && p * n < (o + 1) * d, "ours is the floor");
+    kani::assert(e * d <= p * n && p * n < (e + 1) * d, "engine is the floor");
 }
 
 /// Account layouts match the wrapper's sizing formula (programs/percolator-prog
