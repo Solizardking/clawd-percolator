@@ -1,0 +1,41 @@
+kani-clawd/results/kani-fix47.log:463:ok   ex04_fixed (117s)
+kani-clawd/results/kani-fix47.log:934:ok   ex07_fixed (153s)
+kani-clawd/results/kani-fix47.log:936:::group::FAIL expected: ex04_vulnerable
+kani-clawd/results/kani-fix47.log:1401:ok   ex04_vulnerable refuted as expected (11s)
+kani-clawd/results/kani-fix47.log:1403:::group::FAIL expected: ex07_vulnerable
+kani-clawd/results/kani-fix47.log:1875:ok   ex07_vulnerable refuted as expected (4s)
+kani-clawd/results/kani-fix47.log:1877:Profile passed.
+kani-clawd/results/kani-fast.log:24:ok   risk::proofs::risk_haircut_at_most_one (2s)
+kani-clawd/results/kani-fast.log:49:ok   risk::proofs::risk_haircut_never_exceeds_residual (2s)
+kani-clawd/results/kani-fast.log:74:ok   risk::proofs::risk_fee_sweep_conserves_value (3s)
+kani-clawd/results/kani-fast.log:99:ok   risk::proofs::risk_loss_writeoff_conserves (2s)
+kani-clawd/results/kani-fast.log:124:ok   risk::proofs::risk_warmup_slope_bounds (1s)
+kani-clawd/results/kani-fast.log:607:ok   percolator_backing_fee_charge_conserves (6s)
+kani-clawd/results/kani-fast.log:1090:ok   percolator_earnings_withdraw_conserves (4s)
+kani-clawd/results/kani-fast.log:1573:ok   ex01_fixed (4s)
+kani-clawd/results/kani-fast.log:1575:::group::FAIL expected: ex01_vulnerable
+kani-clawd/results/kani-fast.log:2059:ok   ex01_vulnerable refuted as expected (4s)
+kani-clawd/results/kani-fast.log:2061:Profile passed.
+kani-clawd/results/kani-pairs.log:470:ok   ex01_fixed (109s)
+kani-clawd/results/kani-pairs.log:944:ok   ex02_fixed (17s)
+kani-clawd/results/kani-pairs.log:1415:ok   ex03_fixed (2s)
+kani-clawd/results/kani-pairs.log:1886:ok   ex04_fixed (38s)
+kani-clawd/results/kani-pairs.log:2355:ok   ex05_fixed (2s)
+kani-clawd/results/kani-pairs.log:2824:ok   ex06_fixed (12s)
+kani-clawd/results/kani-pairs.log:3292:FAIL ex07_fixed (121s)
+kani-clawd/results/kani-pairs.log:3763:ok   flow_loss_writeoff_haircut (25s)
+kani-clawd/results/kani-pairs.log:3765:::group::FAIL expected: ex01_vulnerable
+kani-clawd/results/kani-pairs.log:4237:ok   ex01_vulnerable refuted as expected (2s)
+kani-clawd/results/kani-pairs.log:4239:::group::FAIL expected: ex02_vulnerable
+kani-clawd/results/kani-pairs.log:4709:ok   ex02_vulnerable refuted as expected (5s)
+kani-clawd/results/kani-pairs.log:4711:::group::FAIL expected: ex03_vulnerable
+kani-clawd/results/kani-pairs.log:5181:ok   ex03_vulnerable refuted as expected (2s)
+kani-clawd/results/kani-pairs.log:5183:::group::FAIL expected: ex04_vulnerable
+kani-clawd/results/kani-pairs.log:5650:UNEXPECTED PASS ex04_vulnerable (2s)
+kani-clawd/results/kani-pairs.log:5652:::group::FAIL expected: ex05_vulnerable
+kani-clawd/results/kani-pairs.log:6122:ok   ex05_vulnerable refuted as expected (2s)
+kani-clawd/results/kani-pairs.log:6124:::group::FAIL expected: ex06_vulnerable
+kani-clawd/results/kani-pairs.log:6594:ok   ex06_vulnerable refuted as expected (3s)
+kani-clawd/results/kani-pairs.log:6596:::group::FAIL expected: ex07_vulnerable
+kani-clawd/results/kani-pairs.log:7066:ok   ex07_vulnerable refuted as expected (1s)
+kani-clawd/results/kani-pairs.log:7089:FAIL risk::proofs::payout_is_bounded_by_profit (121s)

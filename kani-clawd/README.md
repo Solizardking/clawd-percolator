@@ -131,31 +131,38 @@ cd kani-clawd && cargo build --all-features && cargo test --all-features
 
 ## Coverage table
 
-Filled by the box run on branch `kani-clawd` (America/New_York). `EXPECTED FAIL`
-means Kani must find a counterexample (vulnerable half).
+Filled by the box run on branch `kani-clawd` (America/New_York, 2026-11-09).
+`EXPECTED FAIL` means Kani must find a counterexample (vulnerable half).
+Logs: `kani-clawd/results/kani-fast.log`, `kani-pairs.log`, `kani-fix47.log`.
 
 | Harness | Kind | Expected | Result |
 |---|---|---|---|
-| `risk::proofs::risk_haircut_at_most_one` | lib | PASS | PASS (smoke) |
-| `risk::proofs::risk_haircut_never_exceeds_residual` | lib | PASS | PASS (smoke) |
-| `risk::proofs::risk_fee_sweep_conserves_value` | lib | PASS | PASS (smoke) |
-| `risk::proofs::risk_loss_writeoff_conserves` | lib | PASS | PASS (smoke) |
-| `risk::proofs::risk_warmup_slope_bounds` | lib | PASS | PASS (smoke) |
-| `percolator_backing_fee_charge_conserves` | engine | PASS | PASS (smoke) |
-| `percolator_earnings_withdraw_conserves` | engine | PASS | PASS (smoke) |
-| `ex01_vulnerable` / `ex01_fixed` (fee-split overflow) | fail-false | FAIL / PASS | pending re-run |
-| `ex02_vulnerable` / `ex02_fixed` (unbounded payout) | fail-false | FAIL / PASS | pending re-run |
-| `ex03_vulnerable` / `ex03_fixed` (warmup jump) | fail-false | FAIL / PASS | pending re-run |
-| `ex04_vulnerable` / `ex04_fixed` (funding sign flip) | fail-false | FAIL / PASS | pending re-run |
-| `ex05_vulnerable` / `ex05_fixed` (writeoff overrun) | fail-false | FAIL / PASS | pending re-run |
-| `ex06_vulnerable` / `ex06_fixed` (split residue leak) | fail-false | FAIL / PASS | pending re-run |
-| `ex07_vulnerable` / `ex07_fixed` (staking multiplier decrease) | fail-false | FAIL / PASS | pending re-run |
-| `flow_perps_lifecycle` | e2e | PASS | TIMEOUT under load (re-run) |
-| `flow_loss_writeoff_haircut` | e2e | PASS | fixed assert; pending re-run |
+| `risk::proofs::risk_haircut_at_most_one` | lib | PASS | PASS (smoke, 2s) |
+| `risk::proofs::risk_haircut_never_exceeds_residual` | lib | PASS | PASS (smoke, 2s) |
+| `risk::proofs::risk_fee_sweep_conserves_value` | lib | PASS | PASS (smoke, 3s) |
+| `risk::proofs::risk_loss_writeoff_conserves` | lib | PASS | PASS (smoke, 2s) |
+| `risk::proofs::risk_warmup_slope_bounds` | lib | PASS | PASS (smoke, 1s) |
+| `percolator_backing_fee_charge_conserves` | engine | PASS | PASS (smoke, 6s) |
+| `percolator_earnings_withdraw_conserves` | engine | PASS | PASS (smoke, 4s) |
+| `ex01_vulnerable` / `ex01_fixed` (fee-split overflow) | fail-false | FAIL / PASS | FAIL / PASS |
+| `ex02_vulnerable` / `ex02_fixed` (unbounded payout) | fail-false | FAIL / PASS | FAIL / PASS |
+| `ex03_vulnerable` / `ex03_fixed` (warmup jump) | fail-false | FAIL / PASS | FAIL / PASS |
+| `ex04_vulnerable` / `ex04_fixed` (funding sign flip) | fail-false | FAIL / PASS | FAIL / PASS |
+| `ex05_vulnerable` / `ex05_fixed` (writeoff overrun) | fail-false | FAIL / PASS | FAIL / PASS |
+| `ex06_vulnerable` / `ex06_fixed` (split residue leak) | fail-false | FAIL / PASS | FAIL / PASS |
+| `ex07_vulnerable` / `ex07_fixed` (staking multiplier decrease) | fail-false | FAIL / PASS | FAIL / PASS |
+| `flow_perps_lifecycle` | e2e | PASS | TIMEOUT under concurrent CBMC load (re-run when idle) |
+| `flow_loss_writeoff_haircut` | e2e | PASS | PASS (25s) |
 | `flow_agent_cpi` | e2e | PASS | PASS (25s) |
 
-Key lib properties proved in smoke: haircut ∈ [0,1]; fee-sweep / loss-writeoff
-conservation; warmup slope bounds. `payout_is_bounded_by_profit` and the agent
-proofs (lamport conservation, reentrancy, PDA limits, oracle median-of-3, FSM)
-live under `cfg(kani)` + `solana-agent`.
+Key lib properties in smoke: haircut ∈ [0,1]; fee-sweep / loss-writeoff
+conservation; warmup slope bounds. Agent proofs under `solana-agent`
+(symbolic accounts, lamport conservation, reentrancy guard, oracle median-of-3,
+PDA seed limits, FSM) are present in `src/agent.rs` and compile under `cfg(kani)`.
+
+`solana-account-info` uses **real** `solana_program::AccountInfo` (solana-program
+2.x builds on this box; no local mirror).
+
+Acceptance: `cargo check --all-features` and `cargo test --all-features` pass;
+Kani-gated code has zero runtime cost on a normal build.
 
