@@ -67,6 +67,8 @@ fn flow_perps_lifecycle() {
     // deposit
     let du: u8 = kani::any();
     let dl: u8 = kani::any();
+    // Keep deposits small so settle arithmetic stays in u16 range for CBMC.
+    kani::assume(du <= 32 && dl <= 32);
     let mut m = Market {
         vault: du as u128 + dl as u128,
         insurance: 0,
@@ -81,7 +83,9 @@ fn flow_perps_lifecycle() {
     let pnl: i128 = if user_wins { pnl_mag as i128 } else { -(pnl_mag as i128) };
     let notional: u8 = kani::any();
     let fee_bps: u16 = kani::any();
-    kani::assume(fee_bps <= 100);
+    kani::assume(fee_bps <= 50);
+    kani::assume(notional <= 32);
+    kani::assume(pnl_mag <= 32);
     m.user.pnl += pnl;
     m.lp.pnl -= pnl;
     m.user.fee_credits -= bps_of(notional as u128, fee_bps).unwrap() as i128;

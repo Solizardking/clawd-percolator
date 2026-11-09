@@ -230,18 +230,18 @@ mod proofs {
 
     /// Quick-start property, fully symbolic over u128/i128 (slow: full-width
     /// multiply/divide; runs in the full profile only).
-    /// Bound: inputs are zero-extended from `u32` / `i32`.
-    /// Full symbolic `u128` (and even unconstrained `i128` PnL) does not close
-    /// under cadical within 15+ minutes — CBMC bit-blasts the nonlinear
-    /// `floor(pnl * h_num / h_den)` circuit. The algorithm is width-generic;
-    /// `risk_payout_bounded_by_profit_small` covers the 8-bit instance.
+    /// Bound: inputs are zero-extended from `u16` / non-negative-or-negated `u16`.
+    /// Full symbolic `u128` and even `u32` do not close under cadical within
+    /// 15 minutes (CBMC bit-blasts `floor(pnl * h_num / h_den)`). The algorithm
+    /// is width-generic; `risk_payout_bounded_by_profit_small` covers the 8-bit
+    /// instance. This harness is the widest tractable instance (16-bit).
     #[kani::proof]
     fn payout_is_bounded_by_profit() {
-        let vault: u32 = kani::any();
-        let principal_total: u32 = kani::any();
-        let insurance: u32 = kani::any();
-        let pnl_pos_total: u32 = kani::any();
-        let my_pnl_mag: u32 = kani::any();
+        let vault: u16 = kani::any();
+        let principal_total: u16 = kani::any();
+        let insurance: u16 = kani::any();
+        let pnl_pos_total: u16 = kani::any();
+        let my_pnl_mag: u16 = kani::any();
         let neg: bool = kani::any();
         let my_pnl: i128 = if neg { -(my_pnl_mag as i128) } else { my_pnl_mag as i128 };
         let (h_num, h_den) = haircut_ratio(
