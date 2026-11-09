@@ -1,3 +1,6 @@
+//! On-chain truth 2026-11-09: clawd house portfolios are 9539 B
+//! (e.g. `A5cB2hDT6trFDPwwmgb7qEpjq2SEmph7hRZRxhErPv28`); markets 3163 B
+//! (e.g. `DNnhA2Lvuvu3Ywn1KJRCJqvMeZkZ2qndBXJidUMTQ6PY`). Handoff 9555 is wrong.
 //! Plain `cargo test` guard (no Kani needed) on the Percolator account sizes
 //! the wrapper allocates. Mirrors `percolator_account_layout_sizes`.
 use core::mem::size_of;
@@ -20,7 +23,7 @@ fn market_account_sizes() {
 fn portfolio_account_sizes() {
     let state = size_of::<PortfolioAccountV16Account>();
     assert_eq!(state, 9_419);
-    assert_eq!(HEADER_LEN + state + PORTFOLIO_MATCHER_CONFIG_LEN, 9_539);
+    assert_eq!(HEADER_LEN + state + PORTFOLIO_MATCHER_CONFIG_LEN, 9_539 /* on-chain clawd+devnet 2026-11-09; NOT 9555 */);
 }
 
 #[test]

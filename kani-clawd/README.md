@@ -129,6 +129,31 @@ Normal builds are unaffected:
 cd kani-clawd && cargo build --all-features && cargo test --all-features
 ```
 
+## Account sizes (on-chain truth)
+
+Live `getAccountInfo` on 2026-11-09 (America/New_York). Layout VERSION 18,
+magic `PERCV16\0`. Handoff note of portfolio **9,555 B** is wrong — every
+live portfolio is **9,539 B**. Zero accounts of size 9,555 were found on
+clawd chain or on the Solana-devnet wrapper.
+
+| Account | Address | data_len | Chain |
+|---|---|---:|---|
+| SOL-PERP market slab | `DNnhA2Lvuvu3Ywn1KJRCJqvMeZkZ2qndBXJidUMTQ6PY` | 3,163 | clawd (`rpc.clawdchain.trade`) |
+| BTC-PERP market slab | `GRtaKnxkxFYnFxadn24PqC7S4BJyWeP7LEwJpXpJQ1yr` | 3,163 | clawd |
+| ETH-PERP market slab | `2kaudfmM3TxUWDEih5gtkUucWVt1UuF5SKeFF4aEPore` | 3,163 | clawd |
+| CLAWD-PERP market slab | `Ha2RECxyaKvXNA5KuoLxvJpEQGGdMmn3xBP4FdJQvSb5` | 3,163 | clawd |
+| house SOL portfolio | `A5cB2hDT6trFDPwwmgb7qEpjq2SEmph7hRZRxhErPv28` | 9,539 | clawd (kind=2, ver=18) |
+| house BTC portfolio | `H3W4UoXJCSGdz1UaTSKQy927Mn3HUdLbVXqWQYorPfwv` | 9,539 | clawd |
+| house ETH portfolio | `AJMiw4xee2CgXbKw4FRyPNwPfXZRsoaBu6FRRG2xaYDw` | 9,539 | clawd |
+| house CLAWD portfolio | `BxbRpZ5jniAjP35UEZiZQ8nGLHota1gXKBAJXqJBw6MK` | 9,539 | clawd |
+| Solana-devnet portfolio | `C8dh9AW3eCET5V3hNtSdegcvWs1WwgWZC8toPnnZovsF` | 9,539 | wrapper `6q254q…az8ZT` |
+| Solana-devnet market | `GsL6h6n8VxrodQ15UmmymMoNBWjYn87MPs5S7tCpLjyK` | 3,163 | same wrapper |
+
+`PORTFOLIO_SIZE_BYTES = 9_539` (= 16 header + 9,419 engine + 104 matcher config)
+and `MARKET_SIZE_BYTES = 3_163` (+1,813 per extra asset slot) match
+`scripts/lib/clawd.js` `PORTFOLIO_LEN` / `MARKET_LEN_1SLOT` and the layout dump.
+`getProgramAccounts` with `dataSize=9555` on the Solana-devnet wrapper returned 0.
+
 ## Coverage table
 
 Filled by the box run on branch `kani-clawd` (America/New_York, 2026-11-09).
