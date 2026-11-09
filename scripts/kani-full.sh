@@ -23,7 +23,8 @@ run_pass "" \
   percolator_mul_div_matches_exact \
   percolator_unattributed_loss_lock \
   percolator_effective_pnl_matches_engine_mul_div \
-  flow_perps_lifecycle
+  flow_perps_lifecycle \
+  flow_loss_writeoff_haircut
 
 run_pass "$FEATURES" ex01_fixed ex02_fixed ex03_fixed ex04_fixed ex05_fixed ex06_fixed ex07_fixed
 run_fail "$FEATURES" ex01_vulnerable ex02_vulnerable ex03_vulnerable ex04_vulnerable \

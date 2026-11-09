@@ -84,6 +84,10 @@ name = "flow_perps_lifecycle"
 path = "examples/flow_perps_lifecycle.rs"
 
 [[test]]
+name = "flow_loss_writeoff_haircut"
+path = "examples/flow_loss_writeoff_haircut.rs"
+
+[[test]]
 name = "flow_agent_cpi"
 path = "examples/flow_agent_cpi.rs"
 required-features = ["solana-agent"]

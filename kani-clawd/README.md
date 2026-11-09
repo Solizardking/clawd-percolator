@@ -55,6 +55,16 @@ standing up a formal-methods stack.
   plain `#[kani::proof]`s that Kani must refute; the profile scripts treat a
   pass as a CI failure.
 
+
+## Sibling crate
+
+A parallel harness crate lives outside this repo at
+`/workspace/clawd-percolator-kani` (package `clawd-percolator-kani`). That crate
+owns proofs that call the **real** engine / matcher / stake sources. `kani-clawd`
+owns the kamiyo-kani-style primitives, risk-math specs, agent guard rails,
+fail-false pairs and end-to-end flows. The two crates are complementary — do not
+duplicate engine harnesses here.
+
 ## Install
 
 This crate lives in the repo and is not published. From another crate in this
@@ -114,3 +124,30 @@ Normal builds are unaffected:
 ```bash
 cd kani-clawd && cargo build --all-features && cargo test --all-features
 ```
+
+## Coverage table
+
+Filled by the box run on this branch (America/New_York). `EXPECTED FAIL` means
+Kani must find a counterexample (vulnerable half). Status starts as `pending`
+and is updated after `scripts/kani-fast.sh` / `scripts/kani-full.sh`.
+
+| Harness | Kind | Expected | Result |
+|---|---|---|---|
+| `risk::proofs::risk_haircut_at_most_one` | lib | PASS | pending |
+| `risk::proofs::risk_haircut_never_exceeds_residual` | lib | PASS | pending |
+| `risk::proofs::risk_fee_sweep_conserves_value` | lib | PASS | pending |
+| `risk::proofs::risk_loss_writeoff_conserves` | lib | PASS | pending |
+| `risk::proofs::risk_warmup_slope_bounds` | lib | PASS | pending |
+| `percolator_backing_fee_charge_conserves` | engine | PASS | pending |
+| `percolator_earnings_withdraw_conserves` | engine | PASS | pending |
+| `ex01_vulnerable` / `ex01_fixed` | fail-false | FAIL / PASS | pending |
+| `ex02_vulnerable` / `ex02_fixed` | fail-false | FAIL / PASS | pending |
+| `ex03_vulnerable` / `ex03_fixed` | fail-false | FAIL / PASS | pending |
+| `ex04_vulnerable` / `ex04_fixed` | fail-false | FAIL / PASS | pending |
+| `ex05_vulnerable` / `ex05_fixed` | fail-false | FAIL / PASS | pending |
+| `ex06_vulnerable` / `ex06_fixed` | fail-false | FAIL / PASS | pending |
+| `ex07_vulnerable` / `ex07_fixed` | fail-false | FAIL / PASS | pending |
+| `flow_perps_lifecycle` | e2e | PASS | pending |
+| `flow_loss_writeoff_haircut` | e2e | PASS | pending |
+| `flow_agent_cpi` | e2e | PASS | pending |
+
