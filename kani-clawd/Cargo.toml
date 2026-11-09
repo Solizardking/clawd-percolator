@@ -49,35 +49,32 @@ name = "percolator_engine"
 path = "tests/percolator_engine.rs"
 
 [[test]]
-name = "ex01_unchecked_withdraw"
-path = "examples/ex01_unchecked_withdraw.rs"
+name = "ex01_fee_split_overflow"
+path = "examples/ex01_fee_split_overflow.rs"
 
 [[test]]
-name = "ex02_haircut_ignores_insurance"
-path = "examples/ex02_haircut_ignores_insurance.rs"
+name = "ex02_unbounded_payout"
+path = "examples/ex02_unbounded_payout.rs"
 
 [[test]]
-name = "ex03_fee_split_rounding"
-path = "examples/ex03_fee_split_rounding.rs"
+name = "ex03_warmup_jump"
+path = "examples/ex03_warmup_jump.rs"
 
 [[test]]
-name = "ex04_funding_rounding_mint"
-path = "examples/ex04_funding_rounding_mint.rs"
+name = "ex04_funding_sign_flip"
+path = "examples/ex04_funding_sign_flip.rs"
 
 [[test]]
-name = "ex05_missing_signer_check"
-path = "examples/ex05_missing_signer_check.rs"
-required-features = ["solana-agent"]
+name = "ex05_writeoff_overrun"
+path = "examples/ex05_writeoff_overrun.rs"
 
 [[test]]
-name = "ex06_cpi_reentrancy"
-path = "examples/ex06_cpi_reentrancy.rs"
-required-features = ["solana-agent"]
+name = "ex06_split_residue_leak"
+path = "examples/ex06_split_residue_leak.rs"
 
 [[test]]
-name = "ex07_fsm_skip"
-path = "examples/ex07_fsm_skip.rs"
-required-features = ["solana-agent"]
+name = "ex07_staking_multiplier_decrease"
+path = "examples/ex07_staking_multiplier_decrease.rs"
 
 [[test]]
 name = "flow_perps_lifecycle"

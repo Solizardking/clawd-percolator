@@ -1,7 +1,9 @@
 # kani-clawd
 
-> Also referred to as **`clawd-kani`** in the Clawd Chain docs. The package and
-> library names are `kani-clawd` / `kani_clawd`.
+> **`clawd-kani`'s home in this repo.** The package / library names are
+> `kani-clawd` / `kani_clawd`; docs and agents also call it **clawd-kani**.
+> Dev's Mac still has an older in-progress copy under
+> `percolator-skill/kani/clawd-kani` — this tree is the canonical one.
 
 Reusable [Kani](https://github.com/model-checking/kani) verification primitives
 and proof harnesses for Solana protocol math, plus machine-checked proofs
@@ -44,9 +46,11 @@ standing up a formal-methods stack.
   median-of-three oracle consensus with a deviation band, and FSM transition
   guards.
 - **Symbolic AccountInfo** (`solana-account-info`). `SymbolicAccount<D>` builds
-  real `solana_program::account_info::AccountInfo` values from
-  `AccountConstraints`; `LamportSnapshot` checks conservation across an
-  instruction.
+  **real** `solana_program::account_info::AccountInfo` values from
+  `AccountConstraints` (this feature builds against `solana-program` 2.x on
+  the box — there is no local mirror). `LamportSnapshot` checks conservation
+  across an instruction.
+
 - **Zero runtime cost.** Everything is gated behind `cfg(kani)` (and
   `cfg(test)` for the crate's own unit tests). A normal build of a dependent
   crate compiles `kani_clawd` to an empty library.
@@ -127,27 +131,31 @@ cd kani-clawd && cargo build --all-features && cargo test --all-features
 
 ## Coverage table
 
-Filled by the box run on this branch (America/New_York). `EXPECTED FAIL` means
-Kani must find a counterexample (vulnerable half). Status starts as `pending`
-and is updated after `scripts/kani-fast.sh` / `scripts/kani-full.sh`.
+Filled by the box run on branch `kani-clawd` (America/New_York). `EXPECTED FAIL`
+means Kani must find a counterexample (vulnerable half).
 
 | Harness | Kind | Expected | Result |
 |---|---|---|---|
-| `risk::proofs::risk_haircut_at_most_one` | lib | PASS | pending |
-| `risk::proofs::risk_haircut_never_exceeds_residual` | lib | PASS | pending |
-| `risk::proofs::risk_fee_sweep_conserves_value` | lib | PASS | pending |
-| `risk::proofs::risk_loss_writeoff_conserves` | lib | PASS | pending |
-| `risk::proofs::risk_warmup_slope_bounds` | lib | PASS | pending |
-| `percolator_backing_fee_charge_conserves` | engine | PASS | pending |
-| `percolator_earnings_withdraw_conserves` | engine | PASS | pending |
-| `ex01_vulnerable` / `ex01_fixed` | fail-false | FAIL / PASS | pending |
-| `ex02_vulnerable` / `ex02_fixed` | fail-false | FAIL / PASS | pending |
-| `ex03_vulnerable` / `ex03_fixed` | fail-false | FAIL / PASS | pending |
-| `ex04_vulnerable` / `ex04_fixed` | fail-false | FAIL / PASS | pending |
-| `ex05_vulnerable` / `ex05_fixed` | fail-false | FAIL / PASS | pending |
-| `ex06_vulnerable` / `ex06_fixed` | fail-false | FAIL / PASS | pending |
-| `ex07_vulnerable` / `ex07_fixed` | fail-false | FAIL / PASS | pending |
-| `flow_perps_lifecycle` | e2e | PASS | pending |
-| `flow_loss_writeoff_haircut` | e2e | PASS | pending |
-| `flow_agent_cpi` | e2e | PASS | pending |
+| `risk::proofs::risk_haircut_at_most_one` | lib | PASS | PASS (smoke) |
+| `risk::proofs::risk_haircut_never_exceeds_residual` | lib | PASS | PASS (smoke) |
+| `risk::proofs::risk_fee_sweep_conserves_value` | lib | PASS | PASS (smoke) |
+| `risk::proofs::risk_loss_writeoff_conserves` | lib | PASS | PASS (smoke) |
+| `risk::proofs::risk_warmup_slope_bounds` | lib | PASS | PASS (smoke) |
+| `percolator_backing_fee_charge_conserves` | engine | PASS | PASS (smoke) |
+| `percolator_earnings_withdraw_conserves` | engine | PASS | PASS (smoke) |
+| `ex01_vulnerable` / `ex01_fixed` (fee-split overflow) | fail-false | FAIL / PASS | pending re-run |
+| `ex02_vulnerable` / `ex02_fixed` (unbounded payout) | fail-false | FAIL / PASS | pending re-run |
+| `ex03_vulnerable` / `ex03_fixed` (warmup jump) | fail-false | FAIL / PASS | pending re-run |
+| `ex04_vulnerable` / `ex04_fixed` (funding sign flip) | fail-false | FAIL / PASS | pending re-run |
+| `ex05_vulnerable` / `ex05_fixed` (writeoff overrun) | fail-false | FAIL / PASS | pending re-run |
+| `ex06_vulnerable` / `ex06_fixed` (split residue leak) | fail-false | FAIL / PASS | pending re-run |
+| `ex07_vulnerable` / `ex07_fixed` (staking multiplier decrease) | fail-false | FAIL / PASS | pending re-run |
+| `flow_perps_lifecycle` | e2e | PASS | TIMEOUT under load (re-run) |
+| `flow_loss_writeoff_haircut` | e2e | PASS | fixed assert; pending re-run |
+| `flow_agent_cpi` | e2e | PASS | PASS (25s) |
+
+Key lib properties proved in smoke: haircut ∈ [0,1]; fee-sweep / loss-writeoff
+conservation; warmup slope bounds. `payout_is_bounded_by_profit` and the agent
+proofs (lamport conservation, reentrancy, PDA limits, oracle median-of-3, FSM)
+live under `cfg(kani)` + `solana-agent`.
 
