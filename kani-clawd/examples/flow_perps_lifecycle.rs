@@ -62,6 +62,7 @@ fn settle(m: &mut Market, is_user: bool, elapsed: u64, period: u64) {
 }
 
 #[kani::proof]
+#[kani::unwind(8)]
 fn flow_perps_lifecycle() {
     // deposit
     let du: u8 = kani::any();
