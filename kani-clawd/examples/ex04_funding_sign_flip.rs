@@ -3,6 +3,9 @@
 //! Bug: the short side is charged with the same sign as the long side, so
 //! funding mints (or burns) value instead of transferring it.
 //!
+//! The fixed `funding_payment` rounds toward +∞, so for opposite positions
+//! `pay(p) + pay(-p)` is `0` or `1` (never value-creating, never a large mint).
+//!
 //! cargo kani --tests --harness ex04_vulnerable   # expected: FAILED
 //! cargo kani --tests --harness ex04_fixed        # expected: SUCCESSFUL
 #![cfg(kani)]
@@ -25,8 +28,9 @@ fn check(f: fn(i128, i128, u128) -> Option<i128>) {
     kani::assume(scale > 0 && size > 0);
     let long = f(size as i128, delta as i128, scale as u128).unwrap();
     let short = f(-(size as i128), delta as i128, scale as u128).unwrap();
-    // Fixed funding never creates value (payers round up → sum >= 0).
-    kani::assert(long as i32 + short as i32 >= 0, "funding never pays out more than it collects");
+    let sum = long as i32 + short as i32;
+    // Zero-sum up to one unit in the protocol's favour — a same-sign bug mints 2*|pay|.
+    kani::assert(sum >= 0 && sum <= 1, "funding must be zero-sum up to one unit");
 }
 
 #[kani::proof]

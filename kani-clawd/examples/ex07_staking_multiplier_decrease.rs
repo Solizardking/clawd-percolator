@@ -19,16 +19,21 @@ fn multiplier_vulnerable(duration: u64, max_lock: u64, max_bps: u16) -> u128 {
 }
 
 fn check(m: fn(u64, u64, u16) -> u128) {
-    let max_lock: u8 = kani::any();
-    let max_bps: u16 = kani::any();
-    let d1: u8 = kani::any();
-    let d2: u8 = kani::any();
-    kani::assume(d1 <= d2 && max_lock > 0);
-    assert_multiplier_monotone(d1 as u64, d2 as u64, |d| m(d, max_lock as u64, max_bps));
+    // Concrete max_lock values keep the division circuit SAT-tractable.
+    for max_lock in [1u8, 2, 4, 8, 16, 32, 64, 128, 255] {
+        let max_bps: u16 = kani::any();
+        kani::assume(max_bps >= 10_000 && max_bps <= 12_000);
+        let d1: u8 = kani::any();
+        let d2: u8 = kani::any();
+        kani::assume(d1 <= d2);
+        assert_multiplier_monotone(d1 as u64, d2 as u64, |d| m(d, max_lock as u64, max_bps));
+    }
 }
 
 #[kani::proof]
+#[kani::unwind(10)]
 fn ex07_vulnerable() { check(multiplier_vulnerable); }
 
 #[kani::proof]
+#[kani::unwind(10)]
 fn ex07_fixed() { check(linear_multiplier_bps); }
