@@ -17974,3 +17974,182 @@ fn v16_bpf_oversized_portfolio_account_is_rejected() {
         "a rejected instruction must not change the account's length"
     );
 }
+
+// ---------------------------------------------------------------------------
+// INV-077 (port of upstream aeyakovenko/percolator-prog PR #465, merged
+// 2026-11-14): bound the refresh work of liened claims at trade admission.
+// A crank refresh settles every losing leg of a portfolio in one transaction;
+// losses that burn liened claim face cost far more than losses paid from
+// capital, so an unbounded lien x leg shape can exceed the transaction CU
+// limit -- and a portfolio that cannot be refreshed cannot be liquidated.
+// The wrapper now refuses any trade that would raise a portfolio's
+//     liened_claims + 6 * active_legs
+// past 72 (a portfolio without liens keeps the 14-leg cap alone).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn inv077_source_lien_refresh_bound_constants_match_the_upstream_table() {
+    use percolator_prog::constants::{
+        WRAPPER_MAX_SOURCE_LIEN_REFRESH_WORK as MAX_WORK,
+        WRAPPER_SOURCE_LIEN_REFRESH_LEG_WEIGHT as LEG_WEIGHT,
+    };
+    assert_eq!(LEG_WEIGHT, 6);
+    assert_eq!(MAX_WORK, 72);
+    // Liened claims admitted beside `legs` active legs (upstream's table):
+    // any number of liens up to seven legs (the domain cap binds first),
+    // then 24 / 18 / 12 / 6 / 0.
+    assert_eq!(MAX_WORK - LEG_WEIGHT * 8, 24);
+    assert_eq!(MAX_WORK - LEG_WEIGHT * 9, 18);
+    assert_eq!(MAX_WORK - LEG_WEIGHT * 10, 12);
+    assert_eq!(MAX_WORK - LEG_WEIGHT * 11, 6);
+    assert_eq!(MAX_WORK - LEG_WEIGHT * 12, 0);
+    // Yesterday's reproducers: 27 leftover liens admit seven legs, not eight.
+    assert!(27 + LEG_WEIGHT * 7 <= MAX_WORK && 27 + LEG_WEIGHT * 8 > MAX_WORK);
+    // A single lien: eleven legs fit, the twelfth does not.
+    assert!(1 + LEG_WEIGHT * 11 <= MAX_WORK && 1 + LEG_WEIGHT * 12 > MAX_WORK);
+}
+
+#[test]
+fn inv077_trade_refuses_the_leg_that_raises_refresh_work_past_the_bound() {
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(14, 1_000, 1_000, 500);
+    let taker_owner = Keypair::new();
+    let maker_owner = Keypair::new();
+    let taker = env.create_portfolio(&taker_owner);
+    let maker = env.create_portfolio(&maker_owner);
+    env.deposit(&taker_owner, taker, 1_000_000_000);
+    env.deposit(&maker_owner, maker, 1_000_000_000);
+
+    // Forge ONE liened source claim on the maker's domain 1 (asset 0's
+    // short-side domain -- the legs opened below start at asset 1), replicating
+    // the counterparty-lien bookkeeping of
+    // `v16_lien1_shared_bucket_expire_strands_other_winner` with a far-future
+    // bucket expiry so the lien stays live for the whole test.
+    const LIEN_DOMAIN: usize = 1;
+    env.top_up_backing_bucket(LIEN_DOMAIN as u16, 500, 1_000_000);
+    env.add_source_positive_pnl(maker, LIEN_DOMAIN, 500);
+    let (_, g_pre) = env.market_state();
+    let lien_total = g_pre.source_credit[LIEN_DOMAIN].fresh_reserved_backing_num;
+    assert!(lien_total > 0, "fixture must reserve backing to lien against");
+    env.mutate_market(|_cfg, group| {
+        let sc = &mut group.source_credit[LIEN_DOMAIN];
+        sc.valid_liened_backing_num = lien_total;
+        sc.credit_rate_num = 0;
+        let bucket = &mut group.source_backing_buckets[LIEN_DOMAIN];
+        let total = bucket.fresh_unliened_backing_num + bucket.valid_liened_backing_num;
+        bucket.valid_liened_backing_num = lien_total;
+        bucket.fresh_unliened_backing_num = total - lien_total;
+    });
+    {
+        let mut pa = env.svm.get_account(&maker).unwrap();
+        let mut p = state::read_portfolio(&pa.data).unwrap();
+        p.source_claim_liened_num[LIEN_DOMAIN] = lien_total;
+        p.source_claim_counterparty_liened_num[LIEN_DOMAIN] = lien_total;
+        p.source_lien_counterparty_backing_num[LIEN_DOMAIN] = lien_total;
+        p.source_lien_effective_reserved[LIEN_DOMAIN] = lien_total / BOUND_SCALE;
+        state::write_portfolio(&mut pa.data, &p).unwrap();
+        env.svm.set_account(maker, pa).unwrap();
+    }
+
+    fn liened_claims(env: &V16CuEnv, portfolio: Pubkey) -> usize {
+        env.portfolio_state(portfolio)
+            .source_claim_liened_num
+            .iter()
+            .filter(|&&v| v != 0)
+            .count()
+    }
+    fn active_legs(env: &V16CuEnv, portfolio: Pubkey) -> usize {
+        env.portfolio_state(portfolio)
+            .legs
+            .iter()
+            .filter(|leg| leg.basis_pos_q != 0)
+            .count()
+    }
+    assert_eq!(liened_claims(&env, maker), 1, "fixture lien must be live");
+    assert_eq!(active_legs(&env, maker), 0);
+
+    // Eleven legs beside the one lien: work = 1 + 6 * 11 = 67 <= 72, all open.
+    for asset in 1..12u16 {
+        env.try_trade_asset_with_cu(
+            asset,
+            &taker_owner,
+            taker,
+            &maker_owner,
+            maker,
+            (10 * POS_SCALE) as i128,
+            100,
+            0,
+        )
+        .unwrap_or_else(|error| panic!("leg {asset} is within the bound: {error}"));
+    }
+    assert_eq!(active_legs(&env, maker), 11);
+    assert_eq!(liened_claims(&env, maker), 1, "trades must not disturb the lien");
+
+    // The twelfth leg would raise the maker's work to 1 + 6 * 12 = 73 > 72:
+    // refused, with the whole transaction rolled back on both portfolios.
+    let refused = env
+        .try_trade_asset_with_cu(
+            12,
+            &taker_owner,
+            taker,
+            &maker_owner,
+            maker,
+            (10 * POS_SCALE) as i128,
+            100,
+            0,
+        )
+        .expect_err("the twelfth leg over one lien passes the INV-077 bound");
+    println!("INV-077 refusal error: {refused}");
+    assert!(
+        format!("{refused}").contains("Custom(9)"),
+        "refusal must be the wrapper's InvalidInstruction, not an engine error: {refused}"
+    );
+    assert_eq!(active_legs(&env, maker), 11, "refused trade must roll back");
+    assert_eq!(active_legs(&env, taker), 11, "refused trade must roll back");
+    assert_eq!(liened_claims(&env, maker), 1);
+
+    // Closing a leg lowers the work and is never refused; reopening up to the
+    // bound works again, and the leg past it is still refused.
+    env.trade_asset_with_cu(
+        1,
+        &taker_owner,
+        taker,
+        &maker_owner,
+        maker,
+        -((10 * POS_SCALE) as i128),
+        100,
+        0,
+    );
+    assert_eq!(active_legs(&env, maker), 10, "closing a leg lowers the work");
+    // The reopen below is byte-identical to the refused transaction; expire
+    // the blockhash so LiteSVM does not deduplicate it as AlreadyProcessed.
+    env.svm.expire_blockhash();
+    env.trade_asset_with_cu(
+        12,
+        &taker_owner,
+        taker,
+        &maker_owner,
+        maker,
+        (10 * POS_SCALE) as i128,
+        100,
+        0,
+    );
+    assert_eq!(active_legs(&env, maker), 11, "back within the bound again");
+    let refused = env
+        .try_trade_asset_with_cu(
+            13,
+            &taker_owner,
+            taker,
+            &maker_owner,
+            maker,
+            (10 * POS_SCALE) as i128,
+            100,
+            0,
+        )
+        .expect_err("and the twelfth leg is still past the bound");
+    println!("INV-077 refusal error (reopen): {refused}");
+    assert!(
+        format!("{refused}").contains("Custom(9)"),
+        "refusal must be the wrapper's InvalidInstruction, not an engine error: {refused}"
+    );
+    assert_eq!(active_legs(&env, maker), 11);
+}
