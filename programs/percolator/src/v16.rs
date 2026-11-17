@@ -15617,7 +15617,15 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                 {
                     return Err(V16Error::NonProgress);
                 }
-                self.release_account_source_credit_liens_if_unneeded_core_not_atomic(account)?;
+                // Bounded Live lien release: one domain per crank call (see
+                // AUTO_CRANK_SOURCE_LIEN_RELEASE_DOMAINS_PER_CALL). The
+                // all-at-once core exceeds the CU limit on many-lien shapes;
+                // the crank is permissionless and repeatable, so draining
+                // N domains takes N calls, each at the same bounded cost.
+                self.release_account_source_credit_liens_if_unneeded_bounded_core_not_atomic(
+                    account,
+                    AUTO_CRANK_SOURCE_LIEN_RELEASE_DOMAINS_PER_CALL,
+                )?;
                 AutoCrankOutcomeV16::Progressed(PermissionlessProgressOutcomeV16::AccountCurrent)
             }
             AutoCrankPlanV16::RefreshAccount { asset_index } => {
@@ -15735,6 +15743,56 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         }
         let protective_progress = match request.action {
             PermissionlessCrankActionV16::Refresh => {
+                // Bounded Live lien release (INV-077): this fork's wrapper
+                // dispatches the action crank directly in Live and reaches
+                // the self-classifying auto-crank only in Recovery, so a
+                // flat account's obsolete source liens had no bounded Live
+                // release (Refresh never released them, and the conversion
+                // pre-step releases all domains at once and exceeds the CU
+                // limit on many-lien shapes). Ask the auto-crank's own plan
+                // selector first: when it selects ReleaseSourceLiens for
+                // this account, perform exactly that plan -- one domain per
+                // call, the auto-crank arm's bound -- and report the account
+                // current. Every other plan falls through to the ordinary
+                // Refresh below, so non-flat and not-yet-certified accounts
+                // are unchanged (the plan requires a current certificate,
+                // which the ordinary Refresh produces on the first call).
+                {
+                    let (summary, selected) = self
+                        .build_actionable_summary_and_selected_assets(
+                            &account.as_view(),
+                            request.now_slot,
+                        )?;
+                    let recovery_reason = if summary.expired_close || summary.recovery_eligible {
+                        PermissionlessRecoveryReasonV16::ActiveBankruptCloseCannotProgress
+                    } else {
+                        PermissionlessRecoveryReasonV16::ExplicitLossOrDustAuditOverflow
+                    };
+                    let plan = V16Core::select_auto_crank_plan(
+                        summary,
+                        selected.0.unwrap_or(0),
+                        selected.2.unwrap_or(0),
+                        V16Core::kernel_auto_crank_refresh_asset(selected.1, selected.3),
+                        recovery_reason,
+                    );
+                    if plan == AutoCrankPlanV16::ReleaseSourceLiens {
+                        // Same entry guard as the auto-crank dispatch arm.
+                        if !active_bitmap_is_empty(account.header.active_bitmap.map(V16PodU64::get))
+                            || !Self::account_has_source_liens(&account.as_view())
+                            || self.account_has_active_source_claim_exposure(&account.as_view())?
+                        {
+                            return Err(V16Error::NonProgress);
+                        }
+                        self
+                            .release_account_source_credit_liens_if_unneeded_bounded_core_not_atomic(
+                                account,
+                                AUTO_CRANK_SOURCE_LIEN_RELEASE_DOMAINS_PER_CALL,
+                            )?;
+                        self.validate_shape_audit_scan()?;
+                        account.validate_with_market(&self.as_view())?;
+                        return Ok(PermissionlessProgressOutcomeV16::AccountCurrent);
+                    }
+                }
                 let selected_leg_before = request.asset_index
                     < self.header.config.max_market_slots.get() as usize
                     && Self::active_leg_slot_for_asset(&account.as_view(), request.asset_index)?
@@ -20139,6 +20197,24 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         &mut self,
         account: &mut PortfolioV16ViewMut<'_>,
     ) -> V16Result<u128> {
+        self.release_account_source_credit_liens_if_unneeded_bounded_core_not_atomic(
+            account,
+            usize::MAX,
+        )
+    }
+
+    /// The core release with a per-call domain budget: at most `max_domains`
+    /// domains have a lien released (or an impaired lien normalized) in one
+    /// call; the rest stay liened for the next call. The settle/certify
+    /// prologue and the terminal re-certification run once per call, so the
+    /// call's cost is the fixed prologue plus `max_domains` domain releases,
+    /// independent of how many domains remain liened. With
+    /// `max_domains == usize::MAX` this is the original all-at-once body.
+    fn release_account_source_credit_liens_if_unneeded_bounded_core_not_atomic(
+        &mut self,
+        account: &mut PortfolioV16ViewMut<'_>,
+        max_domains: usize,
+    ) -> V16Result<u128> {
         if decode_market_mode(self.header.mode)? != MarketModeV16::Live {
             return Err(V16Error::LockActive);
         }
@@ -20154,6 +20230,7 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
         }
 
         let mut released_effective = 0u128;
+        let mut released_domains = 0usize;
         let mut slot = 0usize;
         while slot < PORTFOLIO_SOURCE_DOMAIN_CAP {
             let source_snapshot = account.header.source_domains[slot];
@@ -20228,6 +20305,10 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                 released_effective = released_effective
                     .checked_add(impaired_effective)
                     .ok_or(V16Error::ArithmeticOverflow)?;
+                released_domains += 1;
+                if released_domains >= max_domains {
+                    break;
+                }
                 slot += 1;
                 continue;
             }
@@ -20236,6 +20317,10 @@ impl<'a, T> MarketGroupV16ViewMut<'a, T> {
                     .checked_add(effective)
                     .ok_or(V16Error::ArithmeticOverflow)?;
                 self.release_account_source_credit_lien_for_domain_not_atomic(account, d, false)?;
+                released_domains += 1;
+                if released_domains >= max_domains {
+                    break;
+                }
             }
             slot += 1;
         }
@@ -22665,6 +22750,18 @@ pub const TERMINAL_SLAB_SCAN_ASSETS_PER_CALL: usize = 256;
 /// the one-call settlement uses, so that no call's work grows with the number of
 /// losing legs times the number of source claims.
 pub const RESOLVED_KF_SETTLEMENT_LEGS_PER_CALL: usize = 2;
+/// Most source domains whose obsolete liens one permissionless crank call
+/// releases for a flat Live account (the auto-crank's `ReleaseSourceLiens`
+/// plan, and the Live wrapper crank that routes to it). Upstream's crank
+/// returns one domain per call; releasing every domain in one call grows
+/// linearly with the number of liened domains and exceeds the transaction
+/// CU limit on the 27-lien shape (measured 1,399,676 of 1,399,700 CU for
+/// the all-at-once conversion pre-step), so the crank path is bounded to
+/// one domain and the caller repeats the crank to drain the rest. The
+/// unbounded core remains for `ConvertReleasedPnl`, whose conversion is
+/// atomic in one instruction and first becomes reachable at bounded cost
+/// once the crank has drained the liens.
+pub const AUTO_CRANK_SOURCE_LIEN_RELEASE_DOMAINS_PER_CALL: usize = 1;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PermissionlessProgressOutcomeV16 {
