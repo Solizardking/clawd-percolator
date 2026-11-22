@@ -204,6 +204,24 @@ pub mod constants {
     // upstream's `WRAPPER_MAX_PORTFOLIO_ASSETS * 2` (14 * 2 = 28 on both forks).
     pub const WRAPPER_MAX_BOUNDED_SOURCE_DOMAINS: usize = WRAPPER_MAX_PORTFOLIO_ASSETS as usize * 2;
 
+    // INV-077 (port of upstream aeyakovenko/percolator-prog PR #465, merged 2026-11-14):
+    // A refresh settles every losing leg of a portfolio in one transaction. A loss paid from
+    // capital or netted against unliened claim face is cheap; a loss that burns liened claim face
+    // is not: every leg that reaches liened face, and every liened claim it burns through, adds
+    // work. With all 28 source domains occupied the costliest refresh measures about
+    //     427k + 73.6k * active_legs + 12k * liened_claims  CU,
+    // which passes the transaction limit at thirteen legs over a single lien, and a portfolio that
+    // cannot be refreshed cannot be liquidated. A portfolio holding liened claim face may therefore
+    // only grow while
+    //     liened_claims + LEG_WEIGHT * active_legs <= MAX_WORK,
+    // which keeps that refresh near 1.31M CU: any number of liens up to seven legs, 24 at eight,
+    // 18 at nine, 12 at ten, 6 at eleven, none from twelve. A portfolio without liens is bounded
+    // by the leg cap alone. (CU coefficients are upstream's, measured on engine 427dc5fc; our
+    // engine diverged earlier, so the boundary CU should be re-measured in the G4 rehearsal --
+    // the admission shape being bounded is identical on both forks.)
+    pub const WRAPPER_SOURCE_LIEN_REFRESH_LEG_WEIGHT: usize = 6;
+    pub const WRAPPER_MAX_SOURCE_LIEN_REFRESH_WORK: usize = 72;
+
     // ── Protocol-fee program change ─────────────────────────────────────
     // See ~/v17/PROTOCOL-FEE-DESIGN.md §0/§2. `PROTOCOL_FEE_BPS` is the
     // rate applied via `fee_share_floor` to 100% of every trade-fee credit
@@ -9059,6 +9077,8 @@ pub mod processor {
                 source_lien_effective_reserved_snapshot_for_trade_view(&account_a)?;
             let source_lien_before_b =
                 source_lien_effective_reserved_snapshot_for_trade_view(&account_b)?;
+            let source_lien_work_before_a = source_lien_refresh_work_view(&account_a);
+            let source_lien_work_before_b = source_lien_refresh_work_view(&account_b);
             // Taker-only (design §1A): account_a is always the taker/fee-payer
             // (§1A.2). Whether account_a occupies the engine's first
             // (long_account) or second (short_account) positional slot
@@ -9229,6 +9249,14 @@ pub mod processor {
                 source_lien_effective_reserved_snapshot_for_trade_view(&account_a)?;
             let source_lien_after_b =
                 source_lien_effective_reserved_snapshot_for_trade_view(&account_b)?;
+            ensure_source_lien_refresh_work_within_wrapper_bound(
+                source_lien_work_before_a,
+                source_lien_refresh_work_view(&account_a),
+            )?;
+            ensure_source_lien_refresh_work_within_wrapper_bound(
+                source_lien_work_before_b,
+                source_lien_refresh_work_view(&account_b),
+            )?;
             ensure_new_source_lien_domains_full_rate_for_trade_view(
                 &group,
                 source_lien_before_a.as_ref(),
@@ -9597,6 +9625,8 @@ pub mod processor {
                 source_lien_effective_reserved_snapshot_for_trade_view(&account_a)?;
             let source_lien_before_b =
                 source_lien_effective_reserved_snapshot_for_trade_view(&account_b)?;
+            let source_lien_work_before_a = source_lien_refresh_work_view(&account_a);
+            let source_lien_work_before_b = source_lien_refresh_work_view(&account_b);
 
             // Taker-only (design §1A.3): batches never reorder -- account_a is
             // always the engine's first (long_account) positional slot for
@@ -9793,6 +9823,14 @@ pub mod processor {
                 source_lien_effective_reserved_snapshot_for_trade_view(&account_a)?;
             let source_lien_after_b =
                 source_lien_effective_reserved_snapshot_for_trade_view(&account_b)?;
+            ensure_source_lien_refresh_work_within_wrapper_bound(
+                source_lien_work_before_a,
+                source_lien_refresh_work_view(&account_a),
+            )?;
+            ensure_source_lien_refresh_work_within_wrapper_bound(
+                source_lien_work_before_b,
+                source_lien_refresh_work_view(&account_b),
+            )?;
             ensure_new_source_lien_domains_full_rate_for_trade_view(
                 &group,
                 source_lien_before_a.as_ref(),
@@ -10159,6 +10197,40 @@ pub mod processor {
         after_count: usize,
     ) -> ProgramResult {
         if after_count > before_count && after_count > constants::WRAPPER_MAX_BOUNDED_SOURCE_DOMAINS
+        {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        Ok(())
+    }
+
+    /// Refresh work of the portfolio's liened claim face (see
+    /// `WRAPPER_MAX_SOURCE_LIEN_REFRESH_WORK`): zero without any, otherwise the number of
+    /// source claims carrying a lien plus the leg weight for every active leg.
+    /// (INV-077, ported from upstream PR #465.)
+    fn source_lien_refresh_work_view(account: &percolator::PortfolioV16ViewMut<'_>) -> usize {
+        let mut liened_claims = 0usize;
+        for slot in account.header.source_domains.iter() {
+            if slot.source_claim_liened_num.get() != 0 {
+                liened_claims += 1;
+            }
+        }
+        if liened_claims == 0 {
+            return 0;
+        }
+        let active_legs = percolator::active_bitmap_count_ones(
+            account.header.active_bitmap.map(percolator::V16PodU64::get),
+        ) as usize;
+        liened_claims + constants::WRAPPER_SOURCE_LIEN_REFRESH_LEG_WEIGHT * active_legs
+    }
+
+    /// A trade may not raise a portfolio's source-lien refresh work past the bound. A trade that
+    /// lowers it, or leaves it where it was, is never refused here.
+    /// (INV-077, ported from upstream PR #465.)
+    fn ensure_source_lien_refresh_work_within_wrapper_bound(
+        before_work: usize,
+        after_work: usize,
+    ) -> ProgramResult {
+        if after_work > before_work && after_work > constants::WRAPPER_MAX_SOURCE_LIEN_REFRESH_WORK
         {
             return Err(PercolatorError::InvalidInstruction.into());
         }
