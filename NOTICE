@@ -1,0 +1,20 @@
+Percolator — Clawd fork
+=======================
+
+This repository contains a fork of the Percolator perpetuals engine.
+
+Upstream:
+  Percolator by Anatoly Yakovenko and contributors
+  https://github.com/aeyakovenko/percolator
+  Licensed under the Apache License 2.0 (see LICENSE).
+
+Intermediate lineage:
+  The program sources in programs/ derive from the dcccrypto/percolator*
+  packages, themselves derived from the upstream engine above. Per-folder
+  upstream LICENSE files are preserved as received.
+
+Fork work:
+  INV-077 invariant port, chunked close, Kani formal-verification
+  harnesses, insurance stake and position NFT programs, and the Solana
+  devnet rehearsal were developed by the Clawd team (Solizardking) and
+  are likewise provided under the Apache License 2.0.

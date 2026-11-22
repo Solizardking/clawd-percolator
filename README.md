@@ -1,39 +1,119 @@
-# clawd-percolator
+# Percolator — Clawd fork
 
-Percolator perpetuals on **Clawd Chain** (test network, test cUSD collateral). Live at https://percolator.clawdchain.trade.
+Perpetual futures on Solana, built on **Percolator**, the open-source perps
+engine by Anatoly Yakovenko (toly):
 
-## Program IDs (Clawd Chain, BPF upgradeable)
+- Upstream engine: https://github.com/aeyakovenko/percolator
+- This fork's program sources derive from the `dcccrypto/percolator*` packages,
+  themselves derived from the upstream engine.
 
-| Program | ID | Source |
-|---|---|---|
-| Wrapper (perps market) | `6Grr3eyuJVME5gDbeT6g6Q3pojQGSuSDaEmHDM7QYhzx` | `programs/percolator-prog` (+ engine crate `programs/percolator`) |
-| Insurance stake | `85rgQvJsqVq5gF9TPMtxmPQaoVMGK1wd6qx1FZqfXk5q` | `programs/percolator-stake` |
-| Position NFT (Token-2022) | `GDaUkuhbErfBuL92oV93bWWHEVn9NF7pRNikSeq6nHLR` | `programs/percolator-nft` |
+This repository collects the Clawd team's work on the engine: the on-chain
+program set (wrapper, insurance stake, position NFT), the INV-077 invariant
+port, and the test and audit material that backs them.
 
-Manifest: `deploy/clawd-percolator.json` (the UI and API read IDs from it). `ids.txt` is used by `cli/`.
-Program sources are forks of github.com/dcccrypto/percolator* (itself derived from aeyakovenko/percolator); upstream LICENSE files are kept in each folder.
+## Attribution — upstream vs this fork
 
-## Architecture
+- **Upstream work** (not ours): the Percolator engine itself, by Anatoly
+  Yakovenko and contributors, and the engine crate's Kani proof suite
+  (`programs/percolator/`) — both inherited through the `dcccrypto/percolator*`
+  lineage. This fork carries, pins, and runs that engine suite; it did not
+  author it.
+- **This fork's own work** (the Clawd team, Solizardking): the wrapper
+  program and its Kani suite (`programs/percolator-prog/`), the insurance
+  stake program and its Kani proof crate (`programs/percolator-stake/`), the
+  position NFT program (`programs/percolator-nft/`), the INV-077 invariant
+  port, the chunked-close work that went upstream as PR #471, and the Solana
+  devnet rehearsal.
 
-- `deploy/hetzner/frontend/server.js` - Node server: SSR page, `/api/markets` (registry memo launches via RPC `getSignaturesForAddress`), `/api/position`, `/api/perp-markets`, `/api/markets/provision`, `/api/tx/<action>`.
-- `deploy/hetzner/frontend/perc-api.js` - builds unsigned txs for the browser wallet (portfolio, deposit, withdraw, trade, stakeDeposit, stakeWithdraw, nftMint, nftBurn). A **house** wallet (`$PERCOLATOR_DATA/house.json`, never in git) is market admin, LP counterparty and the test cUSD mint authority. Market state is in `$PERCOLATOR_DATA/markets.json`.
-- `deploy/hetzner/frontend/perc-core.js` - instruction encoders, PDAs, account layouts.
-- `percolator-launch/` - React component + client JS (`public/percolator-ui.js`).
-- `explorer/`, `extension/pow.js` - shared clawd chain assets.
-- `cli/` - operator scripts (expect keys in `../.keys/`, which is gitignored).
+## What this fork adds
 
-**Price:** each market trades at a fixed `initial_price` (100_000_000 = 100.000000 cUSD) set at market creation; there is no oracle or keeper yet.
+- **INV-077 invariant port** — the upstream INV-077 source-lien invariant
+  ported into the wrapper program: bounded source-lien refresh work at trade
+  admission (port of upstream PR #465), integration of the upstream
+  percolator-prog PR #471 engine changes (engine pin `a55aceb3`), and a bounded
+  live lien release for the PermissionlessCrank. The INV-077 test set passes
+  (five of five tests green).
+- **Chunked close** — the position-close work that went upstream as
+  [aeyakovenko/percolator PR #471](https://github.com/aeyakovenko/percolator/pull/471).
+- **Insurance stake program** (`programs/percolator-stake`) and **position NFT
+  program** (`programs/percolator-nft`, Token-2022) alongside the wrapper
+  (`programs/percolator-prog`, with the engine crate in `programs/percolator`).
+- **Devnet rehearsal** — the full three-program set deployed and rehearsed
+  end-to-end on Solana devnet (G4 rehearsal, 2026-11-14). Devnet program IDs:
 
-## Deploy
+  | Program | Devnet ID |
+  |---|---|
+  | Wrapper | `6q254qTbNZmTzkzfD6Y1jdPrHo6mHPE857jY1gpaz8ZT` |
+  | Stake | `Gah4CraBbLvvvKeZeDsMVbNVsNhCCWLiQa6HeJa6YvST` |
+  | NFT | `4ekVQZatM719dWBLhRfFQCJ26MBdzGjmFPcNLXKF5scz` |
 
-Programs (from inside the validator container, faucet keypair as payer/upgrade authority):
+  These are devnet rehearsal deployments only. No mainnet deployment is
+  claimed or implied.
+
+## Formal verification (Kani)
+
+The invariants are not just tested, they are *proved* — with the evidence
+checked in, labelled by whose work each suite is:
+
+- **Engine suite — upstream's, carried/pinned/run by this fork.**
+  `programs/percolator/kani-list.json` lists **305 harnesses** (Kani 0.67.0,
+  pinned). The checked-in final audit table
+  (`programs/percolator/kani_audit_final.tsv`) records **305/305 PASS** from
+  the full overnight run of 2026-04-25; the runner is
+  `programs/percolator/scripts/run_kani_full_audit.sh`.
+- **Wrapper suite — this fork's own.** `programs/percolator-prog/tests/v16_kani.rs`
+  with the audit write-up in `programs/percolator-prog/kani_audit.md`:
+  **81 harnesses, 81/81 SUCCESSFUL, 0 vacuous** — matcher ABI gates, admin
+  authorization, PDA matching, nonce monotonicity, CPI size binding, crank
+  and circuit-breaker decisions.
+- **Stake suite — this fork's own.** `programs/percolator-stake/kani-proofs/`:
+  **54 harnesses checked in (52 bounded + 2 genuinely inductive)** covering
+  LP deposit/withdraw conservation, anti-inflation, and fairness. Harnesses
+  are checked in; a results log for this suite is **pending** — no pass claim
+  is made for it yet.
+- **clawd-kani — a separate, already-public crate** of reusable Kani proof
+  primitives (40 library harnesses):
+  https://github.com/themusebook/clawd-kani — it likewise has no checked-in
+  results log yet, so treat it as a suite + CI, not a cited green run.
+
+## Layout
+
+- `programs/percolator-prog/` — the wrapper program (market, trade, crank,
+  close), its test suite (`tests/`, including the v16 fork tests and the
+  INV-077 coverage), port notes (`V14_PORT.md`, `V14_TEST_PORT_COVERAGE.md`),
+  and audit material (`security.md`, `kani_audit.md`, `audit-scope.md`).
+- `programs/percolator/` — the pinned engine crate.
+- `programs/percolator-stake/` — insurance staking.
+- `programs/percolator-nft/` — position NFTs (Token-2022).
+- `cli/`, `deploy/`, `percolator-launch/`, `explorer/`, `extension/`, `test/` —
+  the earlier Clawd Chain testnet launch experience, kept in tree as-is.
+
+## Build and test
+
+Programs (per program crate, with the Solana BPF toolchain):
+
 ```
-cargo build-sbf   # in each programs/* crate; pinned engine (see percolator-prog build.rs)
-solana program deploy --url http://127.0.0.1:8080 --keypair /data/ledger/faucet-keypair.json \
-  --program-id <program-keypair.json> target/deploy/<name>.so
+cargo build-sbf   # inside each programs/* crate
 ```
-See `deploy/hetzner/percolator-programs.sh`.
 
-Frontend/API: copy `deploy/hetzner/env.example` to `deploy/hetzner/.env` on the host, then `deploy/hetzner/up.sh` (uses `compose.json` and `percolator-launch.Dockerfile`). Put `house.json` in the data volume.
+Wrapper test suite:
 
-Never commit keypairs, `.env`, ledgers or build outputs.
+```
+cd programs/percolator-prog
+./scripts/ci-test.sh
+# or: cargo test
+```
+
+## License
+
+Apache License 2.0 — see `LICENSE`. The upstream Percolator engine is
+Apache-2.0 licensed; per-folder upstream `LICENSE` files are preserved as
+received. Upstream credit: Anatoly Yakovenko and the Percolator contributors.
+See `NOTICE` for the full attribution.
+
+## Notes
+
+- Browser-signing only in the reference tooling: nothing in this tree signs or
+  sends transactions server-side.
+- No keypairs, `.env` files, ledgers, or build outputs belong in this
+  repository.
