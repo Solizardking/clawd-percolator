@@ -130,6 +130,19 @@ cargo kani --lib
 cargo kani --harness proof_deposit_withdraw_no_inflation_inductive   # one proof
 ```
 
+## The percolator-lean bounty audit
+
+Separate from the fork itself: a full audit of toly's **percolator-lean**
+bounty program (rounds 1–2, Tracks A–G) lives under
+[`bounty/percolator-lean/`](bounty/percolator-lean/) — imported 2026-11-26
+from the private findings repo `Solizardking/percolator-bounty` @ `591675b`.
+Headline: **C-1**, a close/revive type confusion forging ~8.5e18 insurance
+shares, claimed the round-1 mainnet pot (+70 USDC) and was filed publicly as
+[aeyakovenko/percolator-cli#106](https://github.com/aeyakovenko/percolator-cli/issues/106);
+the maintainer fix (percolator-lean head `16ed3fc`) closes C-1 and the
+supporting leads. Round 2's insurance drain was verdicted a bad-debt
+waterfall through intended instructions, not an exploit.
+
 ## Deployments and status
 
 - **Solana devnet — rehearsed.** The three-program set was deployed and

@@ -1,0 +1,57 @@
+name: Kani
+
+on:
+  push:
+    paths:
+      - "kani-clawd/**"
+      - "programs/percolator/**"
+      - "scripts/kani-*.sh"
+      - ".github/workflows/kani.yml"
+  pull_request:
+    paths:
+      - "kani-clawd/**"
+      - "programs/percolator/**"
+      - "scripts/kani-*.sh"
+  schedule:
+    - cron: "17 6 * * 1" # weekly, Monday 06:17 UTC
+  workflow_dispatch:
+
+concurrency:
+  group: kani-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: cargo build/test (no kani)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: kani-clawd
+      - run: cargo build --all-features
+        working-directory: kani-clawd
+      - run: cargo test --all-features
+        working-directory: kani-clawd
+
+  kani:
+    name: kani ${{ matrix.profile }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        profile: [smoke, full]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: kani-clawd
+      - name: Install Kani
+        run: |
+          cargo install --locked kani-verifier
+          cargo kani setup
+      - name: Run ${{ matrix.profile }} profile
+        run: ./scripts/kani-${{ matrix.profile }}.sh
