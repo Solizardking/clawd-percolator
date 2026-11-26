@@ -1,0 +1,90 @@
+[package]
+name = "kani-clawd"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+description = "Reusable Kani verification primitives and proof harnesses for Solana protocol math (Percolator-style risk engines)."
+repository = "https://github.com/Solizardking/clawd-percolator"
+readme = "README.md"
+keywords = ["kani", "solana", "formal-verification", "percolator", "defi"]
+categories = ["development-tools::testing", "cryptography::cryptocurrencies"]
+# Fail-to-fix examples live in examples/ but are built as Kani test targets
+# (see [[test]] entries below), so they are not cargo examples.
+autoexamples = false
+publish = false
+
+[lib]
+name = "kani_clawd"
+path = "src/lib.rs"
+
+# Standalone workspace: the repo root has no Cargo workspace and the programs/*
+# crates each keep their own lockfile, so kani-clawd is its own root and never
+# changes how the existing program builds resolve.
+[workspace]
+
+[features]
+default = []
+# Symbolic agent accounts, lamport conservation, reentrancy, CPI allowlists
+# (cpi_stub!/cpi_contract!), PDA seed limits, oracle consensus, FSM guards.
+solana-agent = []
+# Symbolic solana_program::AccountInfo values and LamportSnapshot.
+solana-account-info = ["dep:solana-program"]
+
+[dependencies]
+solana-program = { version = "2", optional = true, default-features = false }
+
+[dev-dependencies]
+# Percolator proofs call the repo's own v16 risk engine kernels.
+percolator = { path = "../programs/percolator" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+
+[[test]]
+name = "percolator_layout"
+path = "tests/percolator_layout.rs"
+
+[[test]]
+name = "percolator_engine"
+path = "tests/percolator_engine.rs"
+
+[[test]]
+name = "ex01_fee_split_overflow"
+path = "examples/ex01_fee_split_overflow.rs"
+
+[[test]]
+name = "ex02_unbounded_payout"
+path = "examples/ex02_unbounded_payout.rs"
+
+[[test]]
+name = "ex03_warmup_jump"
+path = "examples/ex03_warmup_jump.rs"
+
+[[test]]
+name = "ex04_funding_sign_flip"
+path = "examples/ex04_funding_sign_flip.rs"
+
+[[test]]
+name = "ex05_writeoff_overrun"
+path = "examples/ex05_writeoff_overrun.rs"
+
+[[test]]
+name = "ex06_split_residue_leak"
+path = "examples/ex06_split_residue_leak.rs"
+
+[[test]]
+name = "ex07_staking_multiplier_decrease"
+path = "examples/ex07_staking_multiplier_decrease.rs"
+
+[[test]]
+name = "flow_perps_lifecycle"
+path = "examples/flow_perps_lifecycle.rs"
+
+[[test]]
+name = "flow_loss_writeoff_haircut"
+path = "examples/flow_loss_writeoff_haircut.rs"
+
+[[test]]
+name = "flow_agent_cpi"
+path = "examples/flow_agent_cpi.rs"
+required-features = ["solana-agent"]
